@@ -9,9 +9,8 @@ double GeluNew(double x)
     return .5 * x * (1 + tanh(sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x)));
 }
 
-std::vector<double> LayerNorm(std::vector<double> originalEmbedding, std::vector<double> gamma, std::vector<double> beta, double epsilon)
+std::vector<double> LayerNorm(std::vector<double> originalEmbedding, std::vector<double> gamma, std::vector<double> beta, double epsilon) // originalEmbedding, gamma, beta: 1d
 {
-
     int len = originalEmbedding.size();
     double variance = 0, mean = 0;
 
@@ -27,8 +26,7 @@ std::vector<double> LayerNorm(std::vector<double> originalEmbedding, std::vector
 
     double modifiedStandardDeviation = sqrt(variance + epsilon);
 
-    //
-    std::vector<double> output(len);
+    std::vector<double> output(len); // 1d
     for (int i = 0; i < len; i++)
     {
         double normalizedValue = ((originalEmbedding[i] - mean) / modifiedStandardDeviation);
@@ -38,19 +36,19 @@ std::vector<double> LayerNorm(std::vector<double> originalEmbedding, std::vector
     return output;
 }
 
-std::vector<double> AddVectors(std::vector<double> a, const std::vector<double> &b)
+std::vector<double> AddVectors(std::vector<double> a, const std::vector<double> &b) // a, b: 1d
 {
     for (int i = 0; i < a.size(); i++)
         a[i] += b[i];
     return a;
 }
 
-std::vector<double> SoftMax(std::vector<double> input)
+std::vector<double> SoftMax(std::vector<double> input) // input: 1d
 {
     int len = input.size();
     auto max = *std::max_element(input.begin(), input.end());
 
-    std::vector<double> softmax(len);
+    std::vector<double> softmax(len); // 1d
     for (int i = 0; i < len; i++)
     {
         softmax[i] = exp(input[i] - max);
@@ -64,7 +62,7 @@ std::vector<double> SoftMax(std::vector<double> input)
     return softmax;
 }
 
-double DotProduct(const std::vector<double> &a, const std::vector<double> &b)
+double DotProduct(const std::vector<double> &a, const std::vector<double> &b) // a, b: 1d
 {
     int len = a.size();
     double output = 0;
@@ -73,33 +71,33 @@ double DotProduct(const std::vector<double> &a, const std::vector<double> &b)
     return output;
 }
 
-std::vector<std::vector<double>> Transpose(const std::vector<std::vector<double>> &a)
+std::vector<double> Transpose(const std::vector<double> &a, int n, int m) // a: 2d (n x m) flattened as 1d
 {
-    int n = a.size(), m = a[0].size();
-    std::vector<std::vector<double>> result(m, std::vector<double>(n));
+    std::vector<double> result(m * n); // 2d (m x n) flattened as 1d
     for (int i = 0; i < m; i++)
     {
         for (int j = 0; j < n; j++)
         {
-            result[i][j] = a[j][i];
+            result[i * n + j] = a[j * m + i];
         }
     }
     return result;
 }
 
-std::vector<std::vector<double>> MatMul(const std::vector<std::vector<double>> &a, const std::vector<std::vector<double>> &b)
+std::vector<double> MatMul(const std::vector<double> &a, int aRows, int aCols, // a: 2d (aRows x aCols) flattened as 1d
+                           const std::vector<double> &b, int bRows, int bCols) // b: 2d (bRows x bCols) flattened as 1d
 {
-    assert(a[0].size() == b.size());
+    assert(aCols == bRows);
 
-    std::vector<std::vector<double>> result(a.size(), std::vector<double>(b[0].size(), 0));
+    std::vector<double> result(aRows * bCols, 0); // 2d (aRows x bCols) flattened as 1d
 
-    for (int i = 0; i < a.size(); i++)
+    for (int i = 0; i < aRows; i++)
     {
-        for (int j = 0; j < b[0].size(); j++)
+        for (int j = 0; j < bCols; j++)
         {
-            for (int k = 0; k < b.size(); k++)
+            for (int k = 0; k < bRows; k++)
             {
-                result[i][j] += a[i][k] * b[k][j];
+                result[i * bCols + j] += a[i * aCols + k] * b[k * bCols + j];
             }
         }
     }
@@ -107,81 +105,66 @@ std::vector<std::vector<double>> MatMul(const std::vector<std::vector<double>> &
     return result;
 }
 
-std::vector<std::vector<double>> Attention(std::vector<std::vector<double>> embeddings,
-                                           std::vector<std::vector<double>> qWeights,
-                                           std::vector<std::vector<double>> kWeights,
-                                           std::vector<std::vector<double>> vWeights)
+std::vector<double> Attention(const std::vector<double> &embeddings, int numTokens, int embedDim, // embeddings: 2d (numTokens x embedDim) flattened as 1d
+                              const std::vector<double> &qWeights,                                // 2d (embedDim x headDim) flattened as 1d
+                              const std::vector<double> &kWeights,                                // 2d (embedDim x headDim) flattened as 1d
+                              const std::vector<double> &vWeights,                                // 2d (embedDim x headDim) flattened as 1d
+                              int headDim)
 {
-    int dimensions = qWeights[0].size();
+    auto qProjections = MatMul(embeddings, numTokens, embedDim, qWeights, embedDim, headDim); // 2d (numTokens x headDim) flattened as 1d
+    auto kProjections = MatMul(embeddings, numTokens, embedDim, kWeights, embedDim, headDim); // 2d (numTokens x headDim) flattened as 1d
+    auto vProjections = MatMul(embeddings, numTokens, embedDim, vWeights, embedDim, headDim); // 2d (numTokens x headDim) flattened as 1d
 
-    int en = embeddings.size(), em = embeddings[0].size();
-    int qn = qWeights.size(), qm = qWeights[0].size();
-    int kn = qWeights.size(), km = qWeights[0].size();
-    int vn = qWeights.size(), vm = qWeights[0].size();
+    auto kTranspose = Transpose(kProjections, numTokens, headDim); // 2d (headDim x numTokens) flattened as 1d
 
-    assert(em == qn && em == kn && em == vn);
+    auto qkTranspose = MatMul(qProjections, numTokens, headDim, kTranspose, headDim, numTokens); // 2d (numTokens x numTokens) flattened as 1d
 
-    auto qProjections = MatMul(embeddings, qWeights);
-    auto kProjections = MatMul(embeddings, kWeights);
-    auto vProjections = MatMul(embeddings, vWeights);
+    double dimensionsRoot = sqrt(headDim);
+    for (auto &v : qkTranspose)
+        v /= dimensionsRoot;
 
-    // qk
-    auto qkTranspose = MatMul(qProjections, Transpose(kProjections));
-
-    // scale it down
-    double dimensionsRoot = sqrt(dimensions);
-    for (auto &i : qkTranspose)
+    for (int i = 0; i < numTokens; i++)
     {
-        for (auto &j : i)
-        {
-            j /= dimensionsRoot;
-        }
+        std::vector<double> row(qkTranspose.begin() + i * numTokens, qkTranspose.begin() + (i + 1) * numTokens); // 1d
+        auto softRow = SoftMax(row);                                                                             // 1d
+        for (int j = 0; j < numTokens; j++)
+            qkTranspose[i * numTokens + j] = softRow[j];
     }
 
-    // convert to probability distibution with softmax
-    for (int i = 0; i < en; i++)
-        qkTranspose[i] = SoftMax(qkTranspose[i]);
-    // qkv
-    return MatMul(qkTranspose, vProjections);
+    return MatMul(qkTranspose, numTokens, numTokens, vProjections, numTokens, headDim); // 2d (numTokens x headDim) flattened as 1d
 }
 
-std::vector<std::vector<double>> MultiHeadAttention(std::vector<std::vector<double>> embeddings,
-                                                    std::vector<std::vector<std::vector<double>>> qWeights,
-                                                    std::vector<std::vector<std::vector<double>>> kWeights,
-                                                    std::vector<std::vector<std::vector<double>>> vWeights,
-                                                    std::vector<std::vector<double>> oWeights // output Weights
-)
+std::vector<double> MultiHeadAttention(const std::vector<double> &embeddings, int numTokens, int embedDim, // embeddings: 2d (numTokens x embedDim) flattened as 1d
+                                       const std::vector<double> &qWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                       const std::vector<double> &kWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                       const std::vector<double> &vWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                       const std::vector<double> &oWeights,                                // 2d (embedDim x embedDim) flattened as 1d
+                                       int heads, int headDim)
 {
+    std::vector<double> result(numTokens * embedDim, 0); // 2d (numTokens x embedDim) flattened as 1d
 
-    int heads = qWeights.size();
+    int weightBlockSize = embedDim * headDim;
 
-    assert(heads == kWeights.size() && heads == vWeights.size());
-    assert(oWeights.size() == embeddings[0].size());
-
-    std::vector<std::vector<double>> result(embeddings.size(), std::vector<double>(embeddings[0].size()));
-
-    int offset = embeddings[0].size() / heads;
-
-    for (int i = 0; i < heads; i++)
+    for (int h = 0; h < heads; h++)
     {
-        auto curResult = Attention(embeddings, qWeights[i], kWeights[i], vWeights[i]);
-        for (int j = 0; j < curResult.size(); j++)
-        {
-            for (int k = 0; k < curResult[0].size(); k++)
-            {
-                result[j][offset * i + k] = curResult[j][k];
-            }
-        }
+        std::vector<double> qHead(qWeights.begin() + h * weightBlockSize, qWeights.begin() + (h + 1) * weightBlockSize); // 2d (embedDim x headDim) flattened as 1d
+        std::vector<double> kHead(kWeights.begin() + h * weightBlockSize, kWeights.begin() + (h + 1) * weightBlockSize); // 2d (embedDim x headDim) flattened as 1d
+        std::vector<double> vHead(vWeights.begin() + h * weightBlockSize, vWeights.begin() + (h + 1) * weightBlockSize); // 2d (embedDim x headDim) flattened as 1d
+
+        auto curResult = Attention(embeddings, numTokens, embedDim, qHead, kHead, vHead, headDim); // 2d (numTokens x headDim) flattened as 1d
+
+        for (int j = 0; j < numTokens; j++)
+            for (int k = 0; k < headDim; k++)
+                result[j * embedDim + h * headDim + k] = curResult[j * headDim + k];
     }
 
-    return MatMul(result, oWeights);
+    return MatMul(result, numTokens, embedDim, oWeights, embedDim, embedDim); // 2d (numTokens x embedDim) flattened as 1d
 }
 
-std::vector<double> ForwardPass(const std::vector<double> &weights, const std::vector<double> &biases, const std::vector<double> &inputs, bool gelu = false)
+std::vector<double> ForwardPass(const std::vector<double> &weights, const std::vector<double> &biases, const std::vector<double> &inputs, bool gelu = false) // weights: 2d flattened as 1d, biases/inputs: 1d
 {
-    //
     int countNeurons = biases.size();
-    std::vector<double> output = biases;
+    std::vector<double> output = biases; // 1d
 
     for (int i = 0; i < countNeurons; i++)
     {
@@ -194,73 +177,83 @@ std::vector<double> ForwardPass(const std::vector<double> &weights, const std::v
     return output;
 }
 
-std::vector<std::vector<double>> MLP(std::vector<std::vector<double>> embeddings,
-                                     std::vector<double> l1Weights, // flattened wieghts
-                                     std::vector<double> l1Biases,
-                                     std::vector<double> l2Weights, // flattened weights
-                                     std::vector<double> l2Biases)
+std::vector<double> MLP(const std::vector<double> &embeddings, int numTokens, int dimensions, // embeddings: 2d (numTokens x dimensions) flattened as 1d
+                        const std::vector<double> &l1Weights,                                 // 2d (dimensions x hidden) flattened as 1d
+                        const std::vector<double> &l1Biases,                                  // 1d
+                        const std::vector<double> &l2Weights,                                 // 2d (hidden x dimensions) flattened as 1d
+                        const std::vector<double> &l2Biases)                                  // 1d
 {
-    int n = embeddings.size();
-    int dimensions = embeddings[0].size();
+    std::vector<double> result(numTokens * dimensions); // 2d (numTokens x dimensions) flattened as 1d
 
-    assert(l1Weights.size() == dimensions * l1Biases.size());
-
-    std::vector<std::vector<double>> result(n);
-
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < numTokens; i++)
     {
-        result[i] = ForwardPass(l1Weights, l1Biases, embeddings[i], true);
-        result[i] = ForwardPass(l2Weights, l2Biases, result[i]);
+        std::vector<double> tokenEmbedding(embeddings.begin() + i * dimensions, embeddings.begin() + (i + 1) * dimensions); // 1d
+        auto hiddenOut = ForwardPass(l1Weights, l1Biases, tokenEmbedding, true);                                            // 1d
+        auto out = ForwardPass(l2Weights, l2Biases, hiddenOut);                                                             // 1d
+        for (int j = 0; j < dimensions; j++)
+            result[i * dimensions + j] = out[j];
     }
 
     return result;
 }
 
-std::vector<std::vector<double>> Transformer(std::vector<std::vector<double>> embeddings,
-                                             std::vector<std::vector<std::vector<double>>> qWeights,
-                                             std::vector<std::vector<std::vector<double>>> kWeights,
-                                             std::vector<std::vector<std::vector<double>>> vWeights,
-                                             std::vector<std::vector<double>> oWeights, // output Weights
-                                             std::vector<double> l1Weights,             // flattened wieghts
-                                             std::vector<double> l1Biases,
-                                             std::vector<double> l2Weights, // flattened weights
-                                             std::vector<double> l2Biases,
-                                             std::vector<double> gammaAttention,
-                                             std::vector<double> gammaMLP,
-                                             std::vector<double> betaAttention,
-                                             std::vector<double> betaMLP,
-                                             double epsilonAttention,
-                                             double epsilonMLP)
+std::vector<double> Transformer(const std::vector<double> &embeddings, int numTokens, int embedDim, // embeddings: 2d (numTokens x embedDim) flattened as 1d
+                                const std::vector<double> &qWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                const std::vector<double> &kWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                const std::vector<double> &vWeights,                                // 3d (heads x embedDim x headDim) flattened as 1d
+                                const std::vector<double> &oWeights,                                // 2d (embedDim x embedDim) flattened as 1d
+                                int heads, int headDim,
+                                const std::vector<double> &l1Weights,      // 2d (embedDim x hidden) flattened as 1d
+                                const std::vector<double> &l1Biases,       // 1d
+                                const std::vector<double> &l2Weights,      // 2d (hidden x embedDim) flattened as 1d
+                                const std::vector<double> &l2Biases,       // 1d
+                                const std::vector<double> &gammaAttention, // 1d
+                                const std::vector<double> &gammaMLP,       // 1d
+                                const std::vector<double> &betaAttention,  // 1d
+                                const std::vector<double> &betaMLP,        // 1d
+                                double epsilonAttention,
+                                double epsilonMLP)
 {
+    std::vector<double> layerNormedEmbeddings(numTokens * embedDim); // 2d (numTokens x embedDim) flattened as 1d
 
-    int n = embeddings.size();
-    std::vector<std::vector<double>> layerNormedEmbeddings(n);
-
-    // layernorm for attention
-    for (int i = 0; i < n; i++)
-        layerNormedEmbeddings[i] = LayerNorm(embeddings[i], gammaAttention, betaAttention, epsilonAttention);
-
-    // attention
-    auto attentionResult = MultiHeadAttention(layerNormedEmbeddings, qWeights, kWeights, vWeights, oWeights);
-
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < numTokens; i++)
     {
-
-        // residual connections
-        attentionResult[i] = AddVectors(embeddings[i], attentionResult[i]);
-
-        // layernorm for mlp
-        layerNormedEmbeddings[i] = LayerNorm(attentionResult[i], gammaMLP, betaMLP, epsilonMLP);
+        std::vector<double> tokenEmbedding(embeddings.begin() + i * embedDim, embeddings.begin() + (i + 1) * embedDim); // 1d
+        auto normed = LayerNorm(tokenEmbedding, gammaAttention, betaAttention, epsilonAttention);                       // 1d
+        for (int j = 0; j < embedDim; j++)
+            layerNormedEmbeddings[i * embedDim + j] = normed[j];
     }
 
-    // mlp
-    auto MLPResult = MLP(layerNormedEmbeddings, l1Weights, l1Biases, l2Weights, l2Biases);
+    auto attentionResult = MultiHeadAttention(layerNormedEmbeddings, numTokens, embedDim, qWeights, kWeights, vWeights, oWeights, heads, headDim); // 2d (numTokens x embedDim) flattened as 1d
 
-    // residual connections
-    for (int i = 0; i < n; i++)
-        MLPResult[i] = AddVectors(attentionResult[i], MLPResult[i]);
+    std::vector<double> normedForMLP(numTokens * embedDim); // 2d (numTokens x embedDim) flattened as 1d
 
-    return MLPResult;
+    for (int i = 0; i < numTokens; i++)
+    {
+        std::vector<double> origToken(embeddings.begin() + i * embedDim, embeddings.begin() + (i + 1) * embedDim);           // 1d
+        std::vector<double> attnToken(attentionResult.begin() + i * embedDim, attentionResult.begin() + (i + 1) * embedDim); // 1d
+
+        auto withResidual = AddVectors(origToken, attnToken); // 1d
+        for (int j = 0; j < embedDim; j++)
+            attentionResult[i * embedDim + j] = withResidual[j];
+
+        auto normed = LayerNorm(withResidual, gammaMLP, betaMLP, epsilonMLP); // 1d
+        for (int j = 0; j < embedDim; j++)
+            normedForMLP[i * embedDim + j] = normed[j];
+    }
+
+    auto MLPResult = MLP(normedForMLP, numTokens, embedDim, l1Weights, l1Biases, l2Weights, l2Biases); // 2d (numTokens x embedDim) flattened as 1d
+
+    for (int i = 0; i < numTokens; i++)
+    {
+        std::vector<double> attnToken(attentionResult.begin() + i * embedDim, attentionResult.begin() + (i + 1) * embedDim); // 1d
+        std::vector<double> mlpToken(MLPResult.begin() + i * embedDim, MLPResult.begin() + (i + 1) * embedDim);              // 1d
+        auto withResidual = AddVectors(attnToken, mlpToken);                                                                 // 1d
+        for (int j = 0; j < embedDim; j++)
+            MLPResult[i * embedDim + j] = withResidual[j];
+    }
+
+    return MLPResult; // 2d (numTokens x embedDim) flattened as 1d
 }
 
 std::vector<double> GPT()
