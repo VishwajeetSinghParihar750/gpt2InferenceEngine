@@ -1,3 +1,6 @@
+
+#pragma once
+
 constexpr int VOCAB_SIZE = 50257;
 constexpr int N_EMBD = 768;
 constexpr int N_HEAD = 12;
