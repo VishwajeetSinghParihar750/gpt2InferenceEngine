@@ -1,5 +1,4 @@
 #include "constants.hh"
-#include "global.hh"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -501,9 +500,6 @@ std::vector<TransformerInput> LoadTransformerWeights() {
 
     std::ifstream qkvBiases("../weights/transformer.h." + std::to_string(i) +
                             ".attn.c_attn.bias.txt");
-
-    // ===================================================================
-    // TORODOOD
 
     // Attention output projection
     std::ifstream attnOutputProjWeights("../weights/transformer.h." +
