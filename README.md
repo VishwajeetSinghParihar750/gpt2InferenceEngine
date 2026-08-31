@@ -13,7 +13,7 @@ Hugging Face GPT-2  →  modelLoader (Python)  →  weights/*.txt  →  inferenc
 | Component | Role |
 |-----------|------|
 | `modelLoader/` | Downloads `gpt2` via `transformers`, flattens each parameter to a space-separated text file |
-| `weights/` | Exported model weights (one file per tensor, gitignored — generate locally or see [demo weights](https://github.com/VishwajeetSinghParihar750/gpt2-demo-weights)) |
+| `weights/` | Exported model weights (one file per tensor) |
 | `inference/` | C++ forward pass: attention, MLP, residual connections, weight loading |
 
 ## Model Spec (GPT-2 Small)
@@ -80,8 +80,6 @@ python main.py
 ```
 
 The script loads `GPT2LMHeadModel.from_pretrained("gpt2")` and writes one `.txt` file per parameter into `weights/`. Re-run this step if you need to refresh weights or export a different checkpoint.
-
-The `weights/` directory is gitignored (real weights are ~1.4 GB). For the expected file layout without model data, see the companion repo [gpt2-demo-weights](https://github.com/VishwajeetSinghParihar750/gpt2-demo-weights).
 
 ## Building Inference
 
