@@ -132,7 +132,3 @@ This repo is under active development. Implemented so far:
 ## Contributing
 
 Issues and pull requests are welcome. Useful next steps include finishing weight loading, wiring up the full model graph, adding a minimal tokenizer, and validating outputs against Hugging Face reference runs.
-
-## License
-
-No license file is included yet. Add one before distributing or reusing this code.
