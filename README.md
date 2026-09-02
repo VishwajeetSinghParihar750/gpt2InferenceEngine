@@ -87,7 +87,7 @@ There is no build system yet. Compile manually from the `inference/` directory (
 
 ```bash
 cd inference
-g++ -std=c++17 -O2 -o gpt2 main.cc
+g++ -std=c++20 -O2 -o gpt2 main.cc
 ./gpt2
 ```
 
