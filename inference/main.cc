@@ -3,17 +3,18 @@
 #include <cassert>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <string>
-#include <iostream>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "include/json.hpp"
 
-double GeluNew(double x)
-{
+double GeluNew(double x) {
   return .5 * x * (1 + tanh(sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x)));
 }
 
@@ -38,8 +39,7 @@ LayerNorm(std::span<const double> originalEmbedding,
   double modifiedStandardDeviation = sqrt(variance + epsilon);
 
   std::vector<double> output(len); // 1d
-  for (int i = 0; i < len; i++)
-  {
+  for (int i = 0; i < len; i++) {
     double normalizedValue =
         ((originalEmbedding[i] - mean) / modifiedStandardDeviation);
     output[i] = normalizedValue * gamma[i] + beta[i];
@@ -63,8 +63,7 @@ std::vector<double> SoftMax(std::span<const double> input) // input: 1d
   auto max = *std::max_element(input.begin(), input.end());
 
   std::vector<double> softmax(len); // 1d
-  for (int i = 0; i < len; i++)
-  {
+  for (int i = 0; i < len; i++) {
     softmax[i] = exp(input[i] - max);
   }
 
@@ -90,10 +89,8 @@ std::vector<double> Transpose(std::span<const double> a, int n,
                               int m) // a: 2d (n x m) flattened as 1d
 {
   std::vector<double> result(m * n); // 2d (m x n) flattened as 1d
-  for (int i = 0; i < m; i++)
-  {
-    for (int j = 0; j < n; j++)
-    {
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
       result[i * n + j] = a[j * m + i];
     }
   }
@@ -110,12 +107,9 @@ std::vector<double> MatMul(std::span<const double> a, int aRows, int aCols,
   std::vector<double> result(aRows * bCols,
                              0); // 2d (aRows x bCols) flattened as 1d
 
-  for (int i = 0; i < aRows; i++)
-  {
-    for (int j = 0; j < bCols; j++)
-    {
-      for (int k = 0; k < bRows; k++)
-      {
+  for (int i = 0; i < aRows; i++) {
+    for (int j = 0; j < bCols; j++) {
+      for (int k = 0; k < bRows; k++) {
         result[i * bCols + j] += a[i * aCols + k] * b[k * bCols + j];
       }
     }
@@ -126,15 +120,14 @@ std::vector<double> MatMul(std::span<const double> a, int aRows, int aCols,
 
 std::vector<double> Attention(
     std::span<const double> embeddings, int NUM_TOKENS,
-    int embedDim,                     // embeddings: 2d (NUM_TOKENS x embedDim) flattened as 1d
+    int embedDim, // embeddings: 2d (NUM_TOKENS x embedDim) flattened as 1d
     std::span<const double> qWeights, // 2d (embedDim x headDim) flattened as 1d
     std::span<const double> kWeights, // 2d (embedDim x headDim) flattened as 1d
     std::span<const double> vWeights, // 2d (embedDim x headDim) flattened as 1d
     std::span<const double> qBiases,  // 1d
     std::span<const double> kBiases,  // 1d
     std::span<const double> vBiases,  // 1d
-    int headDim)
-{
+    int headDim) {
 
   auto qProjections =
       MatMul(embeddings, NUM_TOKENS, embedDim, qWeights, embedDim,
@@ -147,10 +140,8 @@ std::vector<double> Attention(
       MatMul(embeddings, NUM_TOKENS, embedDim, vWeights, embedDim,
              headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
-    for (int j = 0; j < headDim; j++)
-    {
+  for (int i = 0; i < NUM_TOKENS; i++) {
+    for (int j = 0; j < headDim; j++) {
       qProjections[i * headDim + j] += qBiases[j];
       kProjections[i * headDim + j] += kBiases[j];
       vProjections[i * headDim + j] += vBiases[j];
@@ -169,8 +160,7 @@ std::vector<double> Attention(
   for (auto &v : qkTranspose)
     v /= dimensionsRoot;
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
+  for (int i = 0; i < NUM_TOKENS; i++) {
     auto row = std::span(qkTranspose).subspan(i * NUM_TOKENS, NUM_TOKENS);
     auto softRow = SoftMax(row); // 1d
     for (int j = 0; j < NUM_TOKENS; j++)
@@ -203,8 +193,7 @@ std::vector<double> MultiHeadAttention(
 
   int weightBlockSize = embedDim * headDim;
 
-  for (int h = 0; h < heads; h++)
-  {
+  for (int h = 0; h < heads; h++) {
     auto qHead = qWeights.subspan(h * weightBlockSize,
                                   weightBlockSize); // 2d (embedDim x headDim)
     auto kHead = kWeights.subspan(h * weightBlockSize,
@@ -226,12 +215,9 @@ std::vector<double> MultiHeadAttention(
       MatMul(result, NUM_TOKENS, embedDim, oWeights, embedDim,
              embedDim); // 2d (NUM_TOKENS x embedDim) flattened as 1d
 
-  if (!oBiases.empty())
-  {
-    for (int i = 0; i < NUM_TOKENS; i++)
-    {
-      for (int j = 0; j < embedDim; j++)
-      {
+  if (!oBiases.empty()) {
+    for (int i = 0; i < NUM_TOKENS; i++) {
+      for (int j = 0; j < embedDim; j++) {
         projectionResult[i * embedDim + j] += oBiases[j];
       }
     }
@@ -248,8 +234,7 @@ ForwardPass(std::span<const double> weights, std::span<const double> biases,
   int countNeurons = biases.size();
   std::vector<double> output(biases.begin(), biases.end()); // 1d
 
-  for (int i = 0; i < countNeurons; i++)
-  {
+  for (int i = 0; i < countNeurons; i++) {
     for (int j = 0; j < inputs.size(); j++)
       output[i] += weights[i * inputs.size() + j] * inputs[j];
 
@@ -263,17 +248,16 @@ std::vector<double>
 MLP(std::span<const double> embeddings, int NUM_TOKENS,
     int dimensions, // embeddings: 2d (NUM_TOKENS x dimensions) flattened as 1d
     std::span<const double>
-        l1Weights,                    // 2d (dimensions x hidden) flattened as 1d
+        l1Weights, // 2d (dimensions x hidden) flattened as 1d
     std::span<const double> l1Biases, // 1d
     std::span<const double>
-        l2Weights,                    // 2d (hidden x dimensions) flattened as 1d
+        l2Weights, // 2d (hidden x dimensions) flattened as 1d
     std::span<const double> l2Biases) // 1d
 {
   std::vector<double> result(
       NUM_TOKENS * dimensions); // 2d (NUM_TOKENS x dimensions) flattened as 1d
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
+  for (int i = 0; i < NUM_TOKENS; i++) {
     auto tokenEmbedding = embeddings.subspan(i * dimensions, dimensions); // 1d
     auto hiddenOut =
         ForwardPass(l1Weights, l1Biases, tokenEmbedding, true); // 1d
@@ -285,8 +269,7 @@ MLP(std::span<const double> embeddings, int NUM_TOKENS,
   return result;
 }
 
-struct TransformerInput
-{
+struct TransformerInput {
   static constexpr int EMBEDDING_DIMENSION = 784;
   static constexpr int HEADS = 12;
   static constexpr int LAYERS = 12;
@@ -311,11 +294,11 @@ struct TransformerInput
       &oWeights; // 2D (embedDim x embedDim), flattened as 1D
 
   const std::vector<double>
-      &l1Weights;                      // 2D (embedDim x hidden), flattened as 1D
+      &l1Weights; // 2D (embedDim x hidden), flattened as 1D
   const std::vector<double> &l1Biases; // 1D
 
   const std::vector<double>
-      &l2Weights;                      // 2D (hidden x embedDim), flattened as 1D
+      &l2Weights; // 2D (hidden x embedDim), flattened as 1D
   const std::vector<double> &l2Biases; // 1D
 
   const std::vector<double> &gammaAttention; // 1D
@@ -348,14 +331,12 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
             const std::vector<double>
                 &embeddings // 2D (NUM_TOKENS x embedDim), flattened as 1D
 
-)
-{
+) {
   std::vector<double> layerNormedEmbeddings(
       NUM_TOKENS * TransformerInput::EMBEDDING_DIMENSION);
   // 2D (NUM_TOKENS x embedDim), flattened as 1D
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
+  for (int i = 0; i < NUM_TOKENS; i++) {
     std::vector<double> tokenEmbedding(
         embeddings.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
         embeddings.begin() + (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
@@ -367,8 +348,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
                             TransformerInput::EPSILON_ATTENTION);
     // 1D
 
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++)
-    {
+    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
       layerNormedEmbeddings[i * TransformerInput::EMBEDDING_DIMENSION + j] =
           normed[j];
     }
@@ -398,8 +378,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
                                    TransformerInput::EMBEDDING_DIMENSION);
   // 2D (NUM_TOKENS x embedDim), flattened as 1D
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
+  for (int i = 0; i < NUM_TOKENS; i++) {
     std::vector<double> origToken(
         embeddings.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
         embeddings.begin() + (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
@@ -416,8 +395,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
     );
     // 1D
 
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++)
-    {
+    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
       attentionResult[i * TransformerInput::EMBEDDING_DIMENSION + j] =
           withResidual[j];
     }
@@ -428,8 +406,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
                             TransformerInput::EPSILON_MLP);
     // 1D
 
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++)
-    {
+    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
       normedForMLP[i * TransformerInput::EMBEDDING_DIMENSION + j] = normed[j];
     }
   }
@@ -447,8 +424,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
       );
   // 2D (NUM_TOKENS x embedDim), flattened as 1D
 
-  for (int i = 0; i < NUM_TOKENS; i++)
-  {
+  for (int i = 0; i < NUM_TOKENS; i++) {
     std::vector<double> attnToken(
         attentionResult.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
         attentionResult.begin() +
@@ -465,8 +441,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
     );
     // 1D
 
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++)
-    {
+    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
       MLPResult[i * TransformerInput::EMBEDDING_DIMENSION + j] =
           withResidual[j];
     }
@@ -476,8 +451,7 @@ Transformer(const TransformerInput &input, const int NUM_TOKENS,
   // 2D (NUM_TOKENS x embedDim), flattened as 1D
 }
 
-struct GptWeights
-{
+struct GptWeights {
   const std::vector<TransformerInput> transformerWeights;
   const std::vector<double> finalLayerNormWeights;
   const std::vector<double> finalLayerNormBiases;
@@ -485,17 +459,14 @@ struct GptWeights
   const std::vector<double> wteWeights;
 };
 
-GptWeights LoadWeights()
-{
+GptWeights LoadWeights() {
 
   auto InputVectorFromFile = [](std::vector<double> &v, std::ifstream &stream,
                                 std::optional<size_t> maxCount =
-                                    std::nullopt) -> void
-  {
+                                    std::nullopt) -> void {
     double inp;
     size_t count = 0;
-    while (stream >> inp)
-    {
+    while (stream >> inp) {
       v.push_back(inp);
       count++;
       if (maxCount.has_value() && count >= maxCount.value())
@@ -507,8 +478,7 @@ GptWeights LoadWeights()
 
   double tempInput;
 
-  for (int i = 0; i < TransformerInput::LAYERS; i++)
-  {
+  for (int i = 0; i < TransformerInput::LAYERS; i++) {
 
     std::vector<double>
         qWeights; // 3D (heads x embedDim x headDim), flattened as 1D
@@ -575,14 +545,15 @@ GptWeights LoadWeights()
     std::ifstream qkvWeights("../weights/transformer.h." + std::to_string(i) +
                              ".attn.c_attn.weight.txt");
 
-    for (int i = 0; i < N_EMBD; i++)
-    {
+    for (int i = 0; i < N_EMBD; i++) {
       InputVectorFromFile(qWeights, qkvWeights, N_EMBD);
       InputVectorFromFile(kWeights, qkvWeights, N_EMBD);
       InputVectorFromFile(vWeights, qkvWeights, N_EMBD);
     }
 
-    Transpose(qWeights, N_EMBD, N_EMBD); // _________________________________________________________________________ take care here , these are transposed
+    Transpose(qWeights, N_EMBD,
+              N_EMBD); // _________________________________________________________________________
+                       // take care here , these are transposed
     Transpose(kWeights, N_EMBD, N_EMBD);
     Transpose(vWeights, N_EMBD, N_EMBD);
 
@@ -609,7 +580,8 @@ GptWeights LoadWeights()
                         gammaAttention, gammaMLP, betaAttention, betaMLP);
   }
 
-  std::vector<double> finalLayerNormWeights, finalLayerNormBiases, wpeWeightsVector, wteWeightsVector;
+  std::vector<double> finalLayerNormWeights, finalLayerNormBiases,
+      wpeWeightsVector, wteWeightsVector;
 
   std::ifstream lnWeights("../weights/transformer.ln_f.weight.txt");
   std::ifstream lnBiases("../weights/transformer.ln_f.bias.txt");
@@ -623,58 +595,92 @@ GptWeights LoadWeights()
   InputVectorFromFile(wpeWeightsVector, wpeWeights);
   InputVectorFromFile(wteWeightsVector, wteWeights);
 
-  return {result, finalLayerNormWeights, finalLayerNormBiases, wpeWeightsVector, wteWeightsVector};
+  return {result, finalLayerNormWeights, finalLayerNormBiases, wpeWeightsVector,
+          wteWeightsVector};
 }
 
 // return next tokens id
-int GPT(const GptWeights &weights, const int numEmbeddings, const std::vector<double> &embeddings)
-{
+int GPT(const GptWeights &weights, const int numEmbeddings,
+        const std::vector<double> &embeddings) {
   //
-  auto result = Transformer(weights.transformerWeights[0], numEmbeddings, embeddings);
+  auto result =
+      Transformer(weights.transformerWeights[0], numEmbeddings, embeddings);
   for (int i = 1; i < N_HEAD; i++)
     result = Transformer(weights.transformerWeights[i], numEmbeddings, result);
 
   //
   std::span<double> lastTokenEmbedding(result.end() - N_EMBD, result.end());
 
-  auto layerNormedResult = LayerNorm(lastTokenEmbedding, weights.finalLayerNormWeights, weights.finalLayerNormBiases, EPSILON);
+  auto layerNormedResult =
+      LayerNorm(lastTokenEmbedding, weights.finalLayerNormWeights,
+                weights.finalLayerNormBiases, EPSILON);
 
-  auto distribution = MatMul(layerNormedResult, 1, N_EMBD, weights.wteWeights, VOCAB_SIZE, N_EMBD); // need transpose here maybe +++++++++++++++++++++++++++++++++++++++++++++++++++=
+  auto distribution =
+      MatMul(layerNormedResult, 1, N_EMBD, weights.wteWeights, VOCAB_SIZE,
+             N_EMBD); // need transpose here maybe
+                      // +++++++++++++++++++++++++++++++++++++++++++++++++++=
 
   auto probDistribution = SoftMax(distribution);
 
-  int maxProbTokenId = std::max_element(probDistribution.begin(), probDistribution.end()) - probDistribution.begin();
+  int maxProbTokenId =
+      std::max_element(probDistribution.begin(), probDistribution.end()) -
+      probDistribution.begin();
 
   return maxProbTokenId;
 }
 
-std::string GetTokenFromTokenId(int tokenId)
-{
-}
-int GetTokenIdFromToken(std::string token)
-{
+std::vector<std::string> g_tokens;
+std::unordered_map<std::string, int> g_tokenToTokenId;
+std::vector<std::pair<std::string, std::string>> g_merges;
+
+void ParseMerges(const nlohmann::json &merges) {
+  g_merges.clear();
+  g_merges.reserve(merges.size());
+  for (const auto &merge : merges) {
+    if (merge.is_string()) {
+      const auto &s = merge.get_ref<const std::string &>();
+      const auto pos = s.find(' ');
+      if (pos == std::string::npos)
+        continue;
+      g_merges.emplace_back(s.substr(0, pos), s.substr(pos + 1));
+    } else if (merge.is_array() && merge.size() == 2) {
+      g_merges.emplace_back(merge[0].get<std::string>(),
+                            merge[1].get<std::string>());
+    }
+  }
 }
 
-std::vector<double> GetEmbeddingFromTokenId(int tokenId, const std::vector<double> &wteWeights)
-{
-  return {wteWeights.begin() + tokenId * N_EMBD, wteWeights.begin() + (tokenId + 1) * N_EMBD};
+std::string GetTokenFromTokenId(int tokenId) {
+  if (tokenId < 0 || tokenId >= static_cast<int>(g_tokens.size()))
+    return "";
+  return g_tokens[tokenId];
 }
 
-std::vector<int> Tokenize(std::string input)
-{
+int GetTokenIdFromToken(std::string token) {
+  auto it = g_tokenToTokenId.find(token);
+  if (it == g_tokenToTokenId.end())
+    return -1;
+  return it->second;
+}
+
+std::vector<double>
+GetEmbeddingFromTokenId(int tokenId, const std::vector<double> &wteWeights) {
+  return {wteWeights.begin() + tokenId * N_EMBD,
+          wteWeights.begin() + (tokenId + 1) * N_EMBD};
+}
+
+std::vector<int> Tokenize(std::string input) {
 
   std::vector<int> result;
   return result;
 }
 
-std::vector<double> GenerateEmbeddings(std::string input, const std::vector<double> &wteWeights)
-{
+std::vector<double> GenerateEmbeddings(std::string input,
+                                       const std::vector<double> &wteWeights) {
   auto tokenIds = Tokenize(input);
 
-  std::vector<double>
-      result;
-  for (auto i : tokenIds)
-  {
+  std::vector<double> result;
+  for (auto i : tokenIds) {
     auto embedding = GetEmbeddingFromTokenId(i, wteWeights);
     std::copy(embedding.begin(), embedding.end(), std::back_inserter(result));
   }
@@ -682,45 +688,42 @@ std::vector<double> GenerateEmbeddings(std::string input, const std::vector<doub
   return result;
 }
 
-std::pair<std::vector<std::string>, std::unordered_map<std::string, int>> LoadVocab()
-{
-
-  std::vector<std::string> tokens(VOCAB_SIZE);
-  std::unordered_map<std::string, int> tokenToTokenId;
-
+std::pair<std::vector<std::string>, std::unordered_map<std::string, int>>
+LoadVocab() {
   using json = nlohmann::json;
+
   std::ifstream f("../weights/tokenizer/tokenizer.json");
-  json data = json::parse(f);
+  assert(f.is_open() && "failed to open tokenizer.json");
 
-  for (auto &[key, value] : data.items())
-  {
-    if (key == "model")
-    {
-      for (auto &[key, value] : value.items())
-      {
+  const json data = json::parse(f);
 
-        if (key == "vocab")
-        {
-          for (auto &[token, tokenId] : value.items())
-          {
-            tokens[tokenId] = token;
-            tokenToTokenId[token] = tokenId;
-          }
-        }
-        else if (key == "merges")
-        {
-          for (auto pairs : value.array())
-          {
-            std::string a = pairs[0], b = pairs[1];
-          }
-        }
-      }
+  g_tokens.assign(VOCAB_SIZE, "");
+  g_tokenToTokenId.clear();
+
+  for (const auto &[token, tokenIdJson] : data["model"]["vocab"].items()) {
+    const int tokenId = tokenIdJson.get<int>();
+    assert(tokenId >= 0 && tokenId < VOCAB_SIZE);
+    g_tokens[tokenId] = token;
+    g_tokenToTokenId[token] = tokenId;
+  }
+
+  if (data.contains("added_tokens")) {
+    for (const auto &added : data["added_tokens"]) {
+      const int tokenId = added["id"].get<int>();
+      const std::string content = added["content"].get<std::string>();
+      if (tokenId >= static_cast<int>(g_tokens.size()))
+        g_tokens.resize(tokenId + 1);
+      g_tokens[tokenId] = content;
+      g_tokenToTokenId[content] = tokenId;
     }
   }
+
+  ParseMerges(data["model"]["merges"]);
+
+  return {g_tokens, g_tokenToTokenId};
 }
 
-int main()
-{
+int main() {
   auto weights = LoadWeights();
 
   auto [tokens, tokenToTokenId] = LoadVocab();
@@ -734,13 +737,13 @@ int main()
   auto embeddings = GenerateEmbeddings(input, weights.wteWeights);
 
   int tokenToGenerate = 100;
-  while (tokenToGenerate--)
-  {
+  while (tokenToGenerate--) {
     auto nextToken = GPT(weights, embeddings.size() / N_EMBD, embeddings);
-    if (tokenToGenerate)
-    {
-      auto nextTokenEmbedding = GetEmbeddingFromTokenId(nextToken, weights.wteWeights);
-      std::copy(nextTokenEmbedding.begin(), nextTokenEmbedding.end(), std::back_inserter(embeddings));
+    if (tokenToGenerate) {
+      auto nextTokenEmbedding =
+          GetEmbeddingFromTokenId(nextToken, weights.wteWeights);
+      std::copy(nextTokenEmbedding.begin(), nextTokenEmbedding.end(),
+                std::back_inserter(embeddings));
     }
 
     std::cout << GetTokenFromTokenId(nextToken);
