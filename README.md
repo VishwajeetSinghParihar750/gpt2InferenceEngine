@@ -1,77 +1,100 @@
 # GPT-2 Inference Engine
 
-A from-scratch C++ inference engine for [OpenAI GPT-2](https://github.com/openai/gpt-2) (small, 124M parameters). Weights are exported from Hugging Face as flat text files and loaded at runtime — no PyTorch or CUDA required for inference.
+A from-scratch C++ inference engine for [OpenAI GPT-2](https://github.com/openai/gpt-2) (small, 124M parameters).
 
-This project is a learning-oriented implementation: matrix ops, layer norm, multi-head attention, MLP blocks, and a full transformer layer are written in plain C++ with `std::vector`.
+No PyTorch. No CUDA. No ML frameworks. Just plain C++ and the standard library.
 
-## Overview
+---
+
+## What it does
+
+You type a prompt. It generates text. That's it.
 
 ```
-Hugging Face GPT-2  →  modelLoader (Python)  →  weights/*.txt  →  inference (C++)
+Enter text: The quick brown fox
+ jumped over the lazy dog and ran into the forest,
 ```
 
-| Component | Role |
-|-----------|------|
-| `modelLoader/` | Downloads `gpt2` via `transformers`, flattens each parameter to a space-separated text file |
-| `weights/` | Exported model weights (one file per tensor) |
-| `inference/` | C++ forward pass: attention, MLP, residual connections, weight loading |
+Under the hood, every step is implemented by hand:
 
-## Model Spec (GPT-2 Small)
+- **BPE tokenizer** — splits your input into tokens using the GPT-2 merge rules, loaded from `tokenizer.json`
+- **Token + positional embeddings** — looks up `wte` and `wpe`, adds them together
+- **12 transformer blocks** — each with pre-norm multi-head attention and a GELU MLP
+- **LM head** — projects the final hidden state against the vocabulary, picks the most likely next token
+- **Autoregressive loop** — appends each generated token and feeds it back in for the next one
 
-Defined in `inference/constants.hh`:
+---
 
-| Parameter | Value |
-|-----------|-------|
-| Vocabulary size | 50,257 |
-| Embedding dimension | 768 |
-| Attention heads | 12 |
-| Head dimension | 64 |
-| Transformer layers | 12 |
-| Context length | 1,024 |
-| MLP hidden size | 3,072 |
+## How it's built
 
-Activation: GELU (GPT-2 "New GELU" approximation).
+Weights are exported from Hugging Face as flat `.txt` files (one file per tensor), then loaded at runtime by the C++ binary. No binary model format, no serialization library.
 
-## Project Structure
+```
+Hugging Face GPT-2
+      ↓  (Python, once)
+modelLoader/main.py
+      ↓
+weights/*.txt          ← one file per parameter, space-separated floats
+      ↓  (C++, every run)
+inference/main.cc
+      ↓
+interactive text generation
+```
+
+---
+
+## Project structure
 
 ```
 gpt2InferenceEngine/
+├── inference/
+│   ├── main.cc          # everything: ops, tokenizer, transformer, main loop
+│   ├── constants.hh     # model hyperparameters
+│   ├── include/
+│   │   └── json.hpp     # single-header JSON (for tokenizer.json)
+│   └── tokenizer/
+│       └── tokenizer.json
 ├── modelLoader/
-│   ├── main.py          # Export weights from Hugging Face
+│   ├── main.py          # exports weights from Hugging Face
 │   ├── pyproject.toml
 │   └── uv.lock
-├── inference/
-│   ├── constants.hh     # Model hyperparameters
-│   └── main.cc          # Core ops, transformer block, weight loading
-├── weights/             # Flattened weight files (generated)
+├── weights/             # generated — one .txt per tensor
 └── README.md
 ```
 
-Each weight file is named after the Hugging Face parameter key, e.g. `transformer.h.0.attn.c_attn.weight.txt`. Values are space-separated floats on a single line.
+---
 
-## Prerequisites
+## Model spec (GPT-2 small)
 
-**Weight export (Python)**
+| Hyperparameter    | Value  |
+|-------------------|--------|
+| Vocabulary size   | 50,257 |
+| Embedding dim     | 768    |
+| Attention heads   | 12     |
+| Head dim          | 64     |
+| Transformer layers| 12     |
+| Context length    | 1,024  |
+| MLP hidden size   | 3,072  |
+| Activation        | GELU (new) |
 
-- Python 3.14+ (see `modelLoader/.python-version`)
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+---
 
-**Inference (C++)**
+## Getting started
 
-- A C++17 compiler (g++ or clang++)
-- Standard library only — no external C++ dependencies
+### 1. Export weights (once)
 
-## Exporting Weights
-
-From the repo root:
+You need Python and [uv](https://docs.astral.sh/uv/) (or pip).
 
 ```bash
 cd modelLoader
-uv sync          # install torch + transformers
-uv run main.py   # writes files to ../weights/
+uv sync
+uv run main.py
 ```
 
-Or with pip:
+This downloads `gpt2` from Hugging Face and writes one `.txt` file per parameter into `../weights/`. Takes a minute or two.
+
+<details>
+<summary>Using pip instead of uv</summary>
 
 ```bash
 cd modelLoader
@@ -79,56 +102,68 @@ pip install torch transformers
 python main.py
 ```
 
-The script loads `GPT2LMHeadModel.from_pretrained("gpt2")` and writes one `.txt` file per parameter into `weights/`. Re-run this step if you need to refresh weights or export a different checkpoint.
+</details>
 
-## Building Inference
+### 2. Build the inference engine
 
-There is no build system yet. Compile manually from the `inference/` directory (weights are loaded via relative paths):
+Requires a C++20 compiler (g++ or clang++). No other dependencies.
 
 ```bash
 cd inference
 g++ -std=c++20 -O2 -o gpt2 main.cc
+```
+
+### 3. Run
+
+```bash
+# run from the inference/ directory so ../weights/ resolves correctly
 ./gpt2
 ```
 
-Run from `inference/` so the `../weights/` paths resolve correctly.
+You'll see weight and vocab loading messages, then an interactive prompt:
 
-> **Note:** `main.cc` includes `global.hh`, which is not yet in the repo. Add an empty placeholder (`#pragma once`) until shared declarations land there. There is also no `main()` entry point yet — the binary will not run end-to-end until the full pipeline is wired up.
+```
+loading weights ...
+weights loaded ...
+loading vocab ...
+vocab loaded...
 
-## Implementation Details
+Enter text: Once upon a time
+```
 
-### Core operations (`inference/main.cc`)
+It generates 20 tokens per prompt, then loops back for another input.
 
-- **LayerNorm** — mean/variance normalization with learned scale and shift
-- **Multi-head attention** — Q/K/V projections, scaled dot-product attention, output projection
-- **MLP** — two linear layers with GELU on the hidden layer
-- **Transformer block** — pre-norm attention sub-layer, residual add, pre-norm MLP sub-layer, residual add
+---
 
-### Weight loading
+## Implementation notes
 
-`LoadTransformerWeights()` reads per-layer files from `weights/`:
+All ops live in `inference/main.cc` and use `std::vector<double>` with flat 1D layouts for matrices.
 
-- Layer norm: `ln_1`, `ln_2` (weight + bias)
-- Attention: `attn.c_attn` (combined Q/K/V weight), `attn.c_proj` (output projection)
-- MLP: `mlp.c_fc`, `mlp.c_proj` (weight + bias)
+| Function | What it does |
+|---|---|
+| `LayerNorm` | Mean/variance normalize, then scale + shift |
+| `SoftMax` | Numerically stable (max subtraction) |
+| `MatMul` | Naive triple loop |
+| `Transpose` | In-place reshape for weight files |
+| `Attention` | Single-head: Q/K/V projections → scaled dot-product → causal mask → softmax → weighted V |
+| `MultiHeadAttention` | Runs 12 heads, concatenates, projects through `c_proj` |
+| `MLP` | `c_fc` (768→3072) + GELU → `c_proj` (3072→768) |
+| `Transformer` | Pre-norm attn block + residual, pre-norm MLP block + residual |
+| `GPT` | Stacks all 12 transformer blocks, final layer norm, dot against `wte` for logits |
+| `Tokenize` | Regex chunking + BPE merge loop (GPT-2 rules from `tokenizer.json`) |
+| `LoadWeights` | Reads all 12 layers + embeddings + final LN from `../weights/` |
+| `LoadVocab` | Parses `tokenizer.json` for vocab and merge table |
 
-Embedding (`transformer.wte`, `transformer.wpe`), final layer norm (`transformer.ln_f`), and language-model head weights are also present in `weights/` for the full forward pass.
+Weight files follow the Hugging Face naming convention, e.g. `transformer.h.0.attn.c_attn.weight.txt`. The Q/K/V weights are interleaved in a single `c_attn` file and split at load time.
 
-## Status
+---
 
-This repo is under active development. Implemented so far:
+## Prerequisites
 
-- [x] Python weight exporter
-- [x] Core math utilities (matmul, softmax, GELU, layer norm)
-- [x] Single transformer block forward pass
-- [x] Per-layer weight file loading (partial)
-- [ ] Attention Q/K/V bias handling
-- [ ] Full 12-layer stack (`GPT()`)
-- [ ] Token embedding + positional encoding
-- [ ] LM head and token sampling
-- [ ] Build system (CMake/Makefile)
-- [ ] End-to-end text generation
+| Tool | Version |
+|---|---|
+| g++ / clang++ | C++20 support |
+| Python | 3.12+ |
+| uv (optional) | any recent |
 
-## Contributing
-
-Issues and pull requests are welcome. Useful next steps include finishing weight loading, wiring up the full model graph, adding a minimal tokenizer, and validating outputs against Hugging Face reference runs.
+No CUDA, no BLAS, no Boost, nothing else.
