@@ -7,9 +7,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <map>
-#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -21,7 +19,6 @@
 #include "kernels/vectorCombine.cuh"
 #include "kernels/softmax.cuh"
 #include "kernels/layerNorm.cuh"
-#include "kernels/dotProduct.cuh"
 #include "kernels/transpose.cuh"
 #include "kernels/causalMask.cuh"
 #include "kernels/vectorMap.cuh"
@@ -354,6 +351,16 @@ GptWeights LoadWeights() {
     return devPtr;
   };
 
+  // Host buffer -> device -> transpose on GPU. Frees hostPtr. Returns device ptr.
+  auto transposeHostToDevice = [&](double *hostPtr, size_t count, int n,
+                                   int m) -> double * {
+    double *dev = copyToDevice(hostPtr, count);
+    delete[] hostPtr;
+    double *devT = CUDA::Transpose(dev, n, m);
+    cudaFree(dev);
+    return devT;
+  };
+
   // For each layer, load from disk to CPU and then copy to device
   for (size_t i = 0; i < LAYERS; i++) {
     double *gammaAttention = new double[D];
@@ -413,16 +420,13 @@ GptWeights LoadWeights() {
       InputVectorFromFilePtr(l2Biases, mlpL2Biases, D);
     }
 
-    // Transpose for device
-    {
-      double *l1T = CUDA::Transpose(l1Weights, D, HIDDEN);
-      delete[] l1Weights;
-      l1Weights = l1T;
-
-      double *l2T = CUDA::Transpose(l2Weights, HIDDEN, D);
-      delete[] l2Weights;
-      l2Weights = l2T;
-    }
+    // Transpose MLP weights on device (host buffers consumed)
+    double *l1Weights_device =
+        transposeHostToDevice(l1Weights, L1_WEIGHT_SIZE, D, HIDDEN);
+    l1Weights = nullptr;
+    double *l2Weights_device =
+        transposeHostToDevice(l2Weights, L2_WEIGHT_SIZE, HIDDEN, D);
+    l2Weights = nullptr;
 
     // Attention QKV weights and biases
     {
@@ -439,22 +443,23 @@ GptWeights LoadWeights() {
         vIdx += D;
       }
 
-      double *qT = CUDA::Transpose(qWeights, D, D);
-      delete[] qWeights;
-      qWeights = qT;
-      double *kT = CUDA::Transpose(kWeights, D, D);
-      delete[] kWeights;
-      kWeights = kT;
-      double *vT = CUDA::Transpose(vWeights, D, D);
-      delete[] vWeights;
-      vWeights = vT;
-
       std::ifstream qkvBiases("../weights/transformer.h." + std::to_string(i) +
                               ".attn.c_attn.bias.txt");
       InputVectorFromFilePtr(qBiases, qkvBiases, D);
       InputVectorFromFilePtr(kBiases, qkvBiases, D);
       InputVectorFromFilePtr(vBiases, qkvBiases, D);
     }
+
+    // Transpose Q/K/V on device (host buffers consumed)
+    double *qWeights_device =
+        transposeHostToDevice(qWeights, ATTN_WEIGHT_SIZE, D, D);
+    qWeights = nullptr;
+    double *kWeights_device =
+        transposeHostToDevice(kWeights, ATTN_WEIGHT_SIZE, D, D);
+    kWeights = nullptr;
+    double *vWeights_device =
+        transposeHostToDevice(vWeights, ATTN_WEIGHT_SIZE, D, D);
+    vWeights = nullptr;
 
     // Attention output projection
     {
@@ -469,36 +474,26 @@ GptWeights LoadWeights() {
       InputVectorFromFilePtr(oBiases, attnOutputProjBiases, ATTN_BIAS_SIZE);
     }
 
-    // Move weights to device
+    // Move remaining (non-transposed) weights to device
     double *gammaAttention_device = copyToDevice(gammaAttention, D);
     double *betaAttention_device = copyToDevice(betaAttention, D);
     double *gammaMLP_device = copyToDevice(gammaMLP, D);
     double *betaMLP_device = copyToDevice(betaMLP, D);
-    double *l1Weights_device = copyToDevice(l1Weights, L1_WEIGHT_SIZE);
     double *l1Biases_device = copyToDevice(l1Biases, HIDDEN);
-    double *l2Weights_device = copyToDevice(l2Weights, L2_WEIGHT_SIZE);
     double *l2Biases_device = copyToDevice(l2Biases, D);
-    double *qWeights_device = copyToDevice(qWeights, ATTN_WEIGHT_SIZE);
-    double *kWeights_device = copyToDevice(kWeights, ATTN_WEIGHT_SIZE);
-    double *vWeights_device = copyToDevice(vWeights, ATTN_WEIGHT_SIZE);
     double *qBiases_device = copyToDevice(qBiases, ATTN_BIAS_SIZE);
     double *kBiases_device = copyToDevice(kBiases, ATTN_BIAS_SIZE);
     double *vBiases_device = copyToDevice(vBiases, ATTN_BIAS_SIZE);
     double *oWeights_device = copyToDevice(oWeights, ATTN_WEIGHT_SIZE);
     double *oBiases_device = copyToDevice(oBiases, ATTN_BIAS_SIZE);
 
-    // Free host memory
+    // Free remaining host memory
     delete[] gammaAttention;
     delete[] betaAttention;
     delete[] gammaMLP;
     delete[] betaMLP;
-    delete[] l1Weights;
     delete[] l1Biases;
-    delete[] l2Weights;
     delete[] l2Biases;
-    delete[] qWeights;
-    delete[] kWeights;
-    delete[] vWeights;
     delete[] qBiases;
     delete[] kBiases;
     delete[] vBiases;

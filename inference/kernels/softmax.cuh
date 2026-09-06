@@ -16,7 +16,7 @@ double *SoftMax(const double *input, int len) // input: 1d
 {
   auto mxLambda = [] __host__ __device__(const double &a,
                                          const double &b) -> double {
-    return std::max(a, b);
+    return a > b ? a : b;
   };
   auto sumLambda = [] __host__ __device__(const double &a,
                                           const double &b) -> double {
@@ -47,7 +47,7 @@ double *SoftMax(const double *input, int len) // input: 1d
 double *SoftMaxInPlace(double *input, int len) {
   auto mxLambda = [] __host__ __device__(const double &a,
                                          const double &b) -> double {
-    return std::max(a, b);
+    return a > b ? a : b;
   };
   auto sumLambda = [] __host__ __device__(const double &a,
                                           const double &b) -> double {

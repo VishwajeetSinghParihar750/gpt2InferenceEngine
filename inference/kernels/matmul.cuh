@@ -10,72 +10,71 @@
 
 namespace CUDA {
 
-  const int tileRows = 32;
-  const int tileCols = tileRows;
+const int tileRows = 32;
+const int tileCols = tileRows;
 
-  template<typename T>
-  __global__ void matMulKernel(const T *a,const T *b, T *c/*  */, int an, int am,
-                              int bn, int bm) {
+// C[an x bm] = A[an x am] * B[bn x bm], requires am == bn.
+template <typename T>
+__global__ void matMulKernel(const T *a, const T *b, T *c, int an, int am,
+                             int bn, int bm) {
 
-    int tileLoops = (am + blockDim.x - 1) / blockDim.x;
+  int tileLoops = (am + blockDim.x - 1) / blockDim.x;
 
-    __shared__ T sharedA[tileRows][tileCols];
-    __shared__ T sharedB[tileRows][tileCols];
+  __shared__ T sharedA[tileRows][tileCols];
+  __shared__ T sharedB[tileRows][tileCols];
 
-    int x = blockDim.x * blockIdx.x, y = blockDim.y * blockIdx.y;
-    T sum = 0;
+  int row = blockDim.y * blockIdx.y + threadIdx.y;
+  int col = blockDim.x * blockIdx.x + threadIdx.x;
+  T sum = 0;
 
-    for (int i = 0; i < tileLoops; i++) {
+  for (int i = 0; i < tileLoops; i++) {
+    int aCol = blockDim.x * i + threadIdx.x;
+    int bRow = blockDim.y * i + threadIdx.y;
 
-      int aiy = (y + threadIdx.y);
-      int aix = blockDim.x * i + threadIdx.x;
+    sharedA[threadIdx.y][threadIdx.x] =
+        (row < an && aCol < am) ? a[row * am + aCol] : 0;
+    sharedB[threadIdx.y][threadIdx.x] =
+        (bRow < bn && col < bm) ? b[bRow * bm + col] : 0;
 
-      int ai = aiy * am + aix;
+    __syncthreads();
 
-      int biy = (blockDim.y * i + threadIdx.y);
-      int bix = x + threadIdx.x;
-      int bi = biy * bm + bix;
-
-      sharedA[threadIdx.y][threadIdx.x] = (aiy < an && aix < am) ? a[ai] : 0;
-      sharedB[threadIdx.y][threadIdx.x] = (biy < bn && bix < bm) ? b[bi] : 0;
-
-      __syncthreads();
-
-      for (int l = 0; l < blockDim.x; l++) {
-        sum += sharedA[threadIdx.y][l] * sharedB[l][threadIdx.x];
-      }
-
-      __syncthreads();
+    for (int l = 0; l < blockDim.x; l++) {
+      sum += sharedA[threadIdx.y][l] * sharedB[l][threadIdx.x];
     }
 
-    if (x < an && y < bm)
-      c[x * bm + y] = sum;
+    __syncthreads();
   }
 
-  // Caller owns the returned pointer (delete[]).
-  template<typename T>
-  T* MatMul(const T* da, size_t aSize, const T* db, size_t bSize,
-            const int an, const int am, const int bn, const int bm) {
+  if (row < an && col < bm)
+    c[row * bm + col] = sum;
+}
 
+// Caller owns the returned pointer (cudaFree).
+template <typename T>
+T *MatMul(const T *da, size_t aSize, const T *db, size_t bSize, const int an,
+          const int am, const int bn, const int bm) {
 
-    T *dc;
-    cudaMalloc(&dc, static_cast<size_t>(an) * bm * sizeof(T));
-    cudaMemset(dc, 0, static_cast<size_t>(an) * bm * sizeof(T));
+  assert(am == bn);
 
-    dim3 threadsPerBlock(tileRows, tileCols);
-    dim3 blocksPerGrid((bm + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                      (an + threadsPerBlock.y - 1) / threadsPerBlock.y);
+  T *dc;
+  cudaMalloc(&dc, static_cast<size_t>(an) * bm * sizeof(T));
+  cudaMemset(dc, 0, static_cast<size_t>(an) * bm * sizeof(T));
 
-    matMulKernel<<<blocksPerGrid, threadsPerBlock>>>(da, db, dc, an, am, bn, bm);
+  dim3 threadsPerBlock(tileCols, tileRows);
+  dim3 blocksPerGrid((bm + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                     (an + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-    cudaError_t cudaError = cudaGetLastError();
-    if (cudaError != cudaSuccess) {
-      std::cout << "kernel error  : " << cudaGetErrorString(cudaError);
-      std::exit(-1);
-    }
+  matMulKernel<<<blocksPerGrid, threadsPerBlock>>>(da, db, dc, an, am, bn, bm);
 
-    cudaDeviceSynchronize();
-
-    return dc;
+  cudaError_t cudaError = cudaGetLastError();
+  if (cudaError != cudaSuccess) {
+    std::cout << "kernel error  : " << cudaGetErrorString(cudaError);
+    std::exit(-1);
   }
-};
+
+  cudaDeviceSynchronize();
+
+  return dc;
+}
+
+}; // namespace CUDA
