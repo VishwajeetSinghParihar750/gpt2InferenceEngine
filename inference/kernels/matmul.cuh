@@ -7,8 +7,6 @@
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <iostream>
-#include <span>
-#include <vector>
 
 namespace CUDA {
 
@@ -16,7 +14,7 @@ namespace CUDA {
   const int tileCols = tileRows;
 
   template<typename T>
-  __global__ void matMulKernel(T *a, T *b, T *c/*  */, int an, int am,
+  __global__ void matMulKernel(const T *a,const T *b, T *c/*  */, int an, int am,
                               int bn, int bm) {
 
     int tileLoops = (am + blockDim.x - 1) / blockDim.x;
@@ -54,33 +52,21 @@ namespace CUDA {
       c[x * bm + y] = sum;
   }
 
+  // Caller owns the returned pointer (delete[]).
   template<typename T>
-  std::vector<T> MatMul( std::span<const T> a, const std::span<const T> &b,
-              const int an, const int am, const int bn, const int bm) {
+  T* MatMul(const T* da, size_t aSize, const T* db, size_t bSize,
+            const int an, const int am, const int bn, const int bm) {
 
-    std::vector<T> c(an * bm);
 
-    T *da, *db, *dc;
-    cudaMalloc(&da, a.size() * sizeof(T));
-    cudaMalloc(&db, b.size() * sizeof(T));
-    cudaMalloc(&dc, c.size() * sizeof(T));
+    T *dc;
+    cudaMalloc(&dc, static_cast<size_t>(an) * bm * sizeof(T));
+    cudaMemset(dc, 0, static_cast<size_t>(an) * bm * sizeof(T));
 
-    cudaMemcpy(da, a.data(), a.size() * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(db, b.data(), b.size() * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemset(dc, 0, c.size() * sizeof(T));
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // call
     dim3 threadsPerBlock(tileRows, tileCols);
     dim3 blocksPerGrid((bm + threadsPerBlock.x - 1) / threadsPerBlock.x,
                       (an + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-    cudaEventRecord(start);
     matMulKernel<<<blocksPerGrid, threadsPerBlock>>>(da, db, dc, an, am, bn, bm);
-    cudaEventRecord(stop);
 
     cudaError_t cudaError = cudaGetLastError();
     if (cudaError != cudaSuccess) {
@@ -90,20 +76,6 @@ namespace CUDA {
 
     cudaDeviceSynchronize();
 
-    float time = 0;
-    cudaEventElapsedTime(&time, start, stop);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    cudaMemcpy(c.data(), dc, an * bm * sizeof(T), cudaMemcpyDeviceToHost);
-
-    std::cout << "elapsed time in ms: " << time << std::endl;
-
-    cudaFree(da);
-    cudaFree(db);
-    cudaFree(dc);
-
-    return c;
+    return dc;
   }
-}
+};

@@ -1,4 +1,7 @@
-#include "constants.hh"
+#include <cuda_device_runtime_api.h>
+#include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
+#include <iostream>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -7,267 +10,160 @@
 #include <limits>
 #include <map>
 #include <numeric>
-#include <optional>
-#include <regex>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
+#include <regex>
+#include "constants.hh"
 #include "include/json.hpp"
-
 #include "kernels/matmul.cuh"
+#include "kernels/vectorCombine.cuh"
+#include "kernels/softmax.cuh"
+#include "kernels/layerNorm.cuh"
+#include "kernels/dotProduct.cuh"
+#include "kernels/transpose.cuh"
+#include "kernels/causalMask.cuh"
+#include "kernels/vectorMap.cuh"
+#include "kernels/packHead.cuh"
+#include "kernels/forwardPass.cuh"
 
-double GeluNew(double x) {
-  return .5 * x * (1 + tanh(sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x)));
-}
-
-std::vector<double>
-LayerNorm(std::span<const double> originalEmbedding,
-          std::span<const double> gamma, std::span<const double> beta,
-          double epsilon) // originalEmbedding, gamma, beta: 1d
-{
-  int len = originalEmbedding.size();
-  double variance = 0, mean = 0;
-
-  for (auto i : originalEmbedding)
-    mean += i;
-
-  mean /= len;
-
-  for (auto i : originalEmbedding)
-    variance += (i - mean) * (i - mean);
-
-  variance /= len;
-
-  double modifiedStandardDeviation = sqrt(variance + epsilon);
-
-  std::vector<double> output(len); // 1d
-  for (int i = 0; i < len; i++) {
-    double normalizedValue =
-        ((originalEmbedding[i] - mean) / modifiedStandardDeviation);
-    output[i] = normalizedValue * gamma[i] + beta[i];
-  }
-
-  return output;
-}
-
-std::vector<double> AddVectors(std::span<const double> a,
-                               std::span<const double> b) // a, b: 1d
-{
-  std::vector<double> result(a.begin(), a.end());
-  for (size_t i = 0; i < result.size(); i++)
-    result[i] += b[i];
-  return result;
-}
-
-std::vector<double> SoftMax(std::span<const double> input) // input: 1d
-{
-  int len = input.size();
-  auto max = *std::max_element(input.begin(), input.end());
-
-  std::vector<double> softmax(len); // 1d
-  for (int i = 0; i < len; i++) {
-    softmax[i] = exp(input[i] - max);
-  }
-
-  auto sum = std::accumulate(softmax.begin(), softmax.end(), 0.0);
-
-  for (auto &i : softmax)
-    i /= sum;
-
-  return softmax;
-}
-
-double DotProduct(std::span<const double> a,
-                  std::span<const double> b) // a, b: 1d
-{
-  int len = a.size();
-  double output = 0;
-  for (int i = 0; i < len; i++)
-    output += a[i] * b[i];
-  return output;
-}
-
-std::vector<double> Transpose(std::span<const double> a, int n,
-                              int m) // a: 2d (n x m) flattened as 1d
-{
-  std::vector<double> result(m * n); // 2d (m x n) flattened as 1d
-  for (int i = 0; i < m; i++) {
-    for (int j = 0; j < n; j++) {
-      result[i * n + j] = a[j * m + i];
-    }
-  }
-  return result;
-}
-
-std::vector<double> Attention(
-    std::span<const double> embeddings, int NUM_TOKENS,
+// Caller owns returned pointer (cudaFree).
+double *Attention(
+    const double *embeddings, int NUM_TOKENS,
     int embedDim, // embeddings: 2d (NUM_TOKENS x embedDim) flattened as 1d
-    std::span<const double>
-        qWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
-    std::span<const double>
-        kWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
-    std::span<const double>
-        vWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
-    std::span<const double> qBiases, // 1d, this head's slice (headDim)
-    std::span<const double> kBiases, // 1d, this head's slice (headDim)
-    std::span<const double> vBiases, // 1d, this head's slice (headDim)
+    const double *qWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
+    const double *kWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
+    const double *vWeights, // 2d (headDim x embedDim) flattened as 1d, transposed
+    const double *qBiases,  // 1d, this head's slice (headDim)
+    const double *kBiases,  // 1d, this head's slice (headDim)
+    const double *vBiases,  // 1d, this head's slice (headDim)
     int headDim) {
-  std::vector<double> qProjections(
-      NUM_TOKENS * headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
-  std::vector<double> kProjections(
-      NUM_TOKENS * headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
-  std::vector<double> vProjections(
-      NUM_TOKENS * headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
+  // q/k/vWeights are headDim x embedDim; project as emb @ W^T + bias
+  auto project = [&](const double *weights, const double *biases) -> double * {
+    double *wT = CUDA::Transpose(weights, headDim, embedDim);
+    double *proj = CUDA::MatMul<double>(
+        embeddings, static_cast<size_t>(NUM_TOKENS) * embedDim, wT,
+        static_cast<size_t>(embedDim) * headDim, NUM_TOKENS, embedDim, embedDim,
+        headDim);
+    cudaFree(wT);
+    CUDA::addRowBias(proj, biases, NUM_TOKENS, headDim);
+    return proj;
+  };
 
-  for (int t = 0; t < NUM_TOKENS; t++) {
-    auto tokenEmb = embeddings.subspan(t * embedDim, embedDim); // 1d
-    for (int d = 0; d < headDim; d++) {
-      auto qRow =
-          qWeights.subspan(d * embedDim, embedDim); // 1d, transposed weight row
-      auto kRow =
-          kWeights.subspan(d * embedDim, embedDim); // 1d, transposed weight row
-      auto vRow =
-          vWeights.subspan(d * embedDim, embedDim); // 1d, transposed weight row
+  double *qProjections = project(qWeights, qBiases);
+  double *kProjections = project(kWeights, kBiases);
+  double *vProjections = project(vWeights, vBiases);
 
-      qProjections[t * headDim + d] = DotProduct(tokenEmb, qRow) + qBiases[d];
-      kProjections[t * headDim + d] = DotProduct(tokenEmb, kRow) + kBiases[d];
-      vProjections[t * headDim + d] = DotProduct(tokenEmb, vRow) + vBiases[d];
-    }
-  }
+  double *kTranspose =
+      CUDA::Transpose(kProjections, NUM_TOKENS, headDim); // (headDim x NUM_TOKENS)
 
-  auto kTranspose =
-      Transpose(kProjections, NUM_TOKENS,
-                headDim); // 2d (headDim x NUM_TOKENS) flattened as 1d
+  double *qkTranspose = CUDA::MatMul<double>(
+      qProjections, static_cast<size_t>(NUM_TOKENS) * headDim, kTranspose,
+      static_cast<size_t>(headDim) * NUM_TOKENS, NUM_TOKENS, headDim, headDim,
+      NUM_TOKENS);
 
-  std::vector<double> qkTranspose = CUDA::MatMul<double>(
-      qProjections, kTranspose, NUM_TOKENS, headDim, headDim, NUM_TOKENS);
+  cudaFree( qProjections);
+  cudaFree( kProjections);
+  cudaFree( kTranspose);
 
   double dimensionsRoot = sqrt(headDim);
-  for (auto &v : qkTranspose)
-    v /= dimensionsRoot;
+
+  CUDA::vectorMapInPlace(qkTranspose, NUM_TOKENS * NUM_TOKENS,
+     [dimensionsRoot] __device__ __host__(double & v){
+          v /= dimensionsRoot;
+          return v;
+  });
 
   // causal mask: token i cannot attend to future tokens j > i
-  for (int i = 0; i < NUM_TOKENS; i++) {
-    for (int j = i + 1; j < NUM_TOKENS; j++)
-      qkTranspose[i * NUM_TOKENS + j] =
-          -std::numeric_limits<double>::infinity();
-  }
+  CUDA::causalMask(qkTranspose, NUM_TOKENS);
 
-  for (int i = 0; i < NUM_TOKENS; i++) {
-    auto row = std::span(qkTranspose).subspan(i * NUM_TOKENS, NUM_TOKENS);
-    auto softRow = SoftMax(row); // 1d
-    for (int j = 0; j < NUM_TOKENS; j++)
-      qkTranspose[i * NUM_TOKENS + j] = softRow[j];
-  }
+  CUDA::SoftMaxRows(qkTranspose, NUM_TOKENS, NUM_TOKENS);
 
-  return CUDA::MatMul<double>(qkTranspose, vProjections, NUM_TOKENS, NUM_TOKENS,
-                              NUM_TOKENS, headDim);
+  double *result = CUDA::MatMul<double>(
+      qkTranspose, static_cast<size_t>(NUM_TOKENS) * NUM_TOKENS, vProjections,
+      static_cast<size_t>(NUM_TOKENS) * headDim, NUM_TOKENS, NUM_TOKENS,
+      NUM_TOKENS, headDim);
+
+  cudaFree(qkTranspose) ;
+  cudaFree(vProjections);
+
+  return result;
 }
 
-std::vector<double> MultiHeadAttention(
-    std::span<const double> embeddings, int NUM_TOKENS,
+// Caller owns returned pointer (cudaFree).
+double *MultiHeadAttention(
+    const double *embeddings, int NUM_TOKENS,
     int embedDim, // embeddings: 2d (NUM_TOKENS x embedDim) flattened as 1d
-    std::span<const double>
-        qWeights, // 3d (heads x headDim x embedDim) flattened as 1d, transposed
-    std::span<const double>
-        kWeights, // 3d (heads x headDim x embedDim) flattened as 1d, transposed
-    std::span<const double>
-        vWeights, // 3d (heads x headDim x embedDim) flattened as 1d, transposed
-    std::span<const double>
-        oWeights, // 2d (embedDim x embedDim) flattened as 1d
+    const double *qWeights, // 3d (heads x headDim x embedDim), transposed
+    const double *kWeights, // 3d (heads x headDim x embedDim), transposed
+    const double *vWeights, // 3d (heads x headDim x embedDim), transposed
+    const double *oWeights, // 2d (embedDim x embedDim) flattened as 1d
     int heads, int headDim,
-    std::span<const double> oBiases, // embedDim 1d
-    std::span<const double>
-        qBiases, // 2d (heads x headDim) flattened as 1d, full
-    std::span<const double>
-        kBiases, // 2d (heads x headDim) flattened as 1d, full
-    std::span<const double>
-        vBiases) // 2d (heads x headDim) flattened as 1d, full
+    const double *oBiases, // embedDim 1d
+    const double *qBiases, // 2d (heads x headDim) flattened as 1d
+    const double *kBiases, // 2d (heads x headDim) flattened as 1d
+    const double *vBiases) // 2d (heads x headDim) flattened as 1d
 {
-  std::vector<double> result(NUM_TOKENS * embedDim,
-                             0); // 2d (NUM_TOKENS x embedDim) flattened as 1d
+  double *result;
+  cudaMalloc(&result, static_cast<size_t>(NUM_TOKENS) * embedDim * sizeof(double));
+  cudaMemset(result, 0, static_cast<size_t>(NUM_TOKENS) * embedDim * sizeof(double));
 
   int weightBlockSize = embedDim * headDim;
 
   for (int h = 0; h < heads; h++) {
-    auto qHead = qWeights.subspan(h * weightBlockSize,
-                                  weightBlockSize); // 2d (headDim x embedDim)
-    auto kHead = kWeights.subspan(h * weightBlockSize,
-                                  weightBlockSize); // 2d (headDim x embedDim)
-    auto vHead = vWeights.subspan(h * weightBlockSize,
-                                  weightBlockSize); // 2d (headDim x embedDim)
+    const double *qHead = qWeights + h * weightBlockSize;
+    const double *kHead = kWeights + h * weightBlockSize;
+    const double *vHead = vWeights + h * weightBlockSize;
 
-    auto qBiasHead =
-        qBiases.subspan(h * headDim, headDim); // 1d, this head's bias slice
-    auto kBiasHead =
-        kBiases.subspan(h * headDim, headDim); // 1d, this head's bias slice
-    auto vBiasHead =
-        vBiases.subspan(h * headDim, headDim); // 1d, this head's bias slice
+    const double *qBiasHead = qBiases + h * headDim;
+    const double *kBiasHead = kBiases + h * headDim;
+    const double *vBiasHead = vBiases + h * headDim;
 
-    auto curResult =
+    double *curResult =
         Attention(embeddings, NUM_TOKENS, embedDim, qHead, kHead, vHead,
-                  qBiasHead, kBiasHead, vBiasHead,
-                  headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
+                  qBiasHead, kBiasHead, vBiasHead, headDim);
 
-    for (int j = 0; j < NUM_TOKENS; j++)
-      for (int k = 0; k < headDim; k++)
-        result[j * embedDim + h * headDim + k] = curResult[j * headDim + k];
+    CUDA::packHead(curResult, result, NUM_TOKENS, headDim, embedDim, h);
+
+    cudaFree(curResult);
   }
 
-  auto projectionResult =
-      CUDA::MatMul<double>(result, oWeights, NUM_TOKENS, embedDim, embedDim, embedDim);
+  double *projectionResult = CUDA::MatMul<double>(
+      result, static_cast<size_t>(NUM_TOKENS) * embedDim, oWeights,
+      static_cast<size_t>(embedDim) * embedDim, NUM_TOKENS, embedDim, embedDim,
+      embedDim);
 
-  for (int i = 0; i < NUM_TOKENS; i++) {
-    for (int j = 0; j < embedDim; j++) {
-      projectionResult[i * embedDim + j] += oBiases[j];
-    }
-  }
+  cudaFree(result);
+
+  CUDA::addRowBias(projectionResult, oBiases, NUM_TOKENS, embedDim);
 
   return projectionResult;
 }
 
-std::vector<double>
-ForwardPass(std::span<const double> weights, std::span<const double> biases,
-            std::span<const double> inputs,
-            bool gelu = false) // weights: 2d (neurons x inputSize) flattened as
-                               // 1d, transposed convention, biases/inputs: 1d
+// Caller owns returned pointer (cudaFree).
+double *MLP(const double *embeddings, int NUM_TOKENS,
+            int dimensions, // embeddings: 2d (NUM_TOKENS x dimensions)
+            const double *l1Weights, // 2d (hidden x dimensions), transposed
+            const double *l1Biases, int l1BiasesSize, // 1d
+            const double *l2Weights, // 2d (dimensions x hidden), transposed
+            const double *l2Biases)  // 1d
 {
-  int countNeurons = biases.size();
-  std::vector<double> output(biases.begin(), biases.end()); // 1d
-
-  for (int i = 0; i < countNeurons; i++) {
-    for (int j = 0; j < inputs.size(); j++)
-      output[i] += weights[i * inputs.size() + j] * inputs[j];
-
-    if (gelu)
-      output[i] = GeluNew(output[i]);
-  }
-  return output;
-}
-
-std::vector<double>
-MLP(std::span<const double> embeddings, int NUM_TOKENS,
-    int dimensions, // embeddings: 2d (NUM_TOKENS x dimensions) flattened as 1d
-    std::span<const double>
-        l1Weights, // 2d (hidden x dimensions) flattened as 1d, transposed
-    std::span<const double> l1Biases, // 1d
-    std::span<const double>
-        l2Weights, // 2d (dimensions x hidden) flattened as 1d, transposed
-    std::span<const double> l2Biases) // 1d
-{
-  std::vector<double> result(
-      NUM_TOKENS * dimensions); // 2d (NUM_TOKENS x dimensions) flattened as 1d
+  double *result;
+  cudaMalloc(&result, static_cast<size_t>(NUM_TOKENS) * dimensions * sizeof(double));
 
   for (int i = 0; i < NUM_TOKENS; i++) {
-    auto tokenEmbedding = embeddings.subspan(i * dimensions, dimensions); // 1d
-    auto hiddenOut =
-        ForwardPass(l1Weights, l1Biases, tokenEmbedding, true); // 1d
-    auto out = ForwardPass(l2Weights, l2Biases, hiddenOut);     // 1d
-    for (int j = 0; j < dimensions; j++)
-      result[i * dimensions + j] = out[j];
+    const double *tokenEmbedding = embeddings + i * dimensions; // 1d
+    double *hiddenOut = CUDA::ForwardPass(
+        l1Weights, l1Biases, l1BiasesSize, tokenEmbedding, dimensions, true);
+    double *out = CUDA::ForwardPass(l2Weights, l2Biases, dimensions, hiddenOut,
+                                    l1BiasesSize);
+    cudaFree(hiddenOut);
+
+    cudaMemcpy(result + i * dimensions, out,
+               static_cast<size_t>(dimensions) * sizeof(double),
+               cudaMemcpyDeviceToDevice);
+    cudaFree(out);
   }
 
   return result;
@@ -283,364 +179,429 @@ struct TransformerInput {
 
   static constexpr int HEAD_DIMENSION = 64;
 
-  const std::vector<double>
-      qWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
-  const std::vector<double>
-      kWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
-  const std::vector<double>
-      vWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
+  // double* for GPU friendliness, plus explicit sizes for safety
+  double *qWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
+  double *kWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
+  double *vWeights; // 3D (heads x headDim x embedDim), flattened as 1D, transposed
 
-  const std::vector<double> qBiases; // 2D (heads x headDim), flattened as 1D
-  const std::vector<double> kBiases; // 2D (heads x headDim), flattened as 1D
-  const std::vector<double> vBiases; // 2D (heads x headDim), flattened as 1D
+  double *qBiases; // 2D (heads x headDim), flattened as 1D
+  double *kBiases; // 2D (heads x headDim), flattened as 1D
+  double *vBiases; // 2D (heads x headDim), flattened as 1D
 
-  const std::vector<double>
-      oWeights; // 2D (embedDim x embedDim), flattened as 1D
-  const std::vector<double> oBiases;
+  double *oWeights; // 2D (embedDim x embedDim), flattened as 1D
+  double *oBiases;
 
-  const std::vector<double>
-      l1Weights; // 2D (hidden x embedDim), flattened as 1D, transposed
-  const std::vector<double> l1Biases; // 1D
+  double *l1Weights; // 2D (hidden x embedDim), flattened as 1D, transposed
+  double *l1Biases;  // 1D
 
-  const std::vector<double>
-      l2Weights; // 2D (embedDim x hidden), flattened as 1D, transposed
-  const std::vector<double> l2Biases; // 1D
+  double *l2Weights; // 2D (embedDim x hidden), flattened as 1D, transposed
+  double *l2Biases;  // 1D
 
-  const std::vector<double> gammaAttention; // 1D
-  const std::vector<double> gammaMLP;       // 1D
+  double *gammaAttention; // 1D
+  double *gammaMLP;       // 1D
 
-  const std::vector<double> betaAttention; // 1D
-  const std::vector<double> betaMLP;       // 1D
+  double *betaAttention; // 1D
+  double *betaMLP;       // 1D
 
-  TransformerInput(std::vector<double> qWeights, std::vector<double> kWeights,
-                   std::vector<double> vWeights, std::vector<double> qBiases,
-                   std::vector<double> kBiases, std::vector<double> vBiases,
-                   std::vector<double> oWeights, std::vector<double> oBiases,
-                   std::vector<double> l1Weights, std::vector<double> l1Biases,
-                   std::vector<double> l2Weights, std::vector<double> l2Biases,
-                   std::vector<double> gammaAttention,
-                   std::vector<double> gammaMLP,
-                   std::vector<double> betaAttention,
-                   std::vector<double> betaMLP)
-      : qWeights(std::move(qWeights)), kWeights(std::move(kWeights)),
-        vWeights(std::move(vWeights)), qBiases(std::move(qBiases)),
-        kBiases(std::move(kBiases)), vBiases(std::move(vBiases)),
-        oWeights(std::move(oWeights)), oBiases(std::move(oBiases)),
-        l1Weights(std::move(l1Weights)), l1Biases(std::move(l1Biases)),
-        l2Weights(std::move(l2Weights)), l2Biases(std::move(l2Biases)),
-        gammaAttention(std::move(gammaAttention)),
-        gammaMLP(std::move(gammaMLP)), betaAttention(std::move(betaAttention)),
-        betaMLP(std::move(betaMLP)) {}
+  // Sizes for all pointers (adapt as needed for real shape calculation)
+  size_t qWeightsSize, kWeightsSize, vWeightsSize;
+  size_t qBiasesSize, kBiasesSize, vBiasesSize;
+  size_t oWeightsSize, oBiasesSize;
+  size_t l1WeightsSize, l1BiasesSize;
+  size_t l2WeightsSize, l2BiasesSize;
+  size_t gammaAttentionSize, gammaMLPSize;
+  size_t betaAttentionSize, betaMLPSize;
+
+  TransformerInput() = default;
+  // Note: ownership is not handled here; you may want to manage with smart pointers if needed!
+  TransformerInput(double *qWeights, size_t qWeightsSize, double *kWeights,
+                   size_t kWeightsSize, double *vWeights, size_t vWeightsSize,
+                   double *qBiases, size_t qBiasesSize, double *kBiases,
+                   size_t kBiasesSize, double *vBiases, size_t vBiasesSize,
+                   double *oWeights, size_t oWeightsSize, double *oBiases,
+                   size_t oBiasesSize, double *l1Weights, size_t l1WeightsSize,
+                   double *l1Biases, size_t l1BiasesSize, double *l2Weights,
+                   size_t l2WeightsSize, double *l2Biases, size_t l2BiasesSize,
+                   double *gammaAttention, size_t gammaAttentionSize,
+                   double *gammaMLP, size_t gammaMLPSize, double *betaAttention,
+                   size_t betaAttentionSize, double *betaMLP,
+                   size_t betaMLPSize)
+      : qWeights(qWeights), qWeightsSize(qWeightsSize), kWeights(kWeights),
+        kWeightsSize(kWeightsSize), vWeights(vWeights),
+        vWeightsSize(vWeightsSize), qBiases(qBiases), qBiasesSize(qBiasesSize),
+        kBiases(kBiases), kBiasesSize(kBiasesSize), vBiases(vBiases),
+        vBiasesSize(vBiasesSize), oWeights(oWeights), oWeightsSize(oWeightsSize),
+        oBiases(oBiases), oBiasesSize(oBiasesSize), l1Weights(l1Weights),
+        l1WeightsSize(l1WeightsSize), l1Biases(l1Biases),
+        l1BiasesSize(l1BiasesSize), l2Weights(l2Weights),
+        l2WeightsSize(l2WeightsSize), l2Biases(l2Biases),
+        l2BiasesSize(l2BiasesSize), gammaAttention(gammaAttention),
+        gammaAttentionSize(gammaAttentionSize), gammaMLP(gammaMLP),
+        gammaMLPSize(gammaMLPSize), betaAttention(betaAttention),
+        betaAttentionSize(betaAttentionSize), betaMLP(betaMLP),
+        betaMLPSize(betaMLPSize) {}
 };
 
-std::vector<double>
-Transformer(const TransformerInput &input, const int NUM_TOKENS,
-            const std::vector<double>
-                &embeddings // 2D (NUM_TOKENS x embedDim), flattened as 1D
-
+// Caller owns returned pointer (cudaFree).
+double *Transformer(const TransformerInput &input, const int NUM_TOKENS,
+                    const double *embeddings // 2D (NUM_TOKENS x embedDim), device
 ) {
-  std::vector<double> layerNormedEmbeddings(
-      NUM_TOKENS * TransformerInput::EMBEDDING_DIMENSION);
-  // 2D (NUM_TOKENS x embedDim), flattened as 1D
+  constexpr int D = TransformerInput::EMBEDDING_DIMENSION;
+  const size_t rowBytes = static_cast<size_t>(D) * sizeof(double);
+
+  auto add = [] __host__ __device__(const double &x, const double &y) -> double {
+    return x + y;
+  };
+
+  double *layerNormedEmbeddings;
+  cudaMalloc(&layerNormedEmbeddings,
+             static_cast<size_t>(NUM_TOKENS) * D * sizeof(double));
 
   for (int i = 0; i < NUM_TOKENS; i++) {
-    std::vector<double> tokenEmbedding(
-        embeddings.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
-        embeddings.begin() + (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
-    // 1D
-
-    auto normed = LayerNorm(tokenEmbedding,       // 1D
-                            input.gammaAttention, // 1D
-                            input.betaAttention,  // 1D
-                            TransformerInput::EPSILON_ATTENTION);
-    // 1D
-
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
-      layerNormedEmbeddings[i * TransformerInput::EMBEDDING_DIMENSION + j] =
-          normed[j];
-    }
+    double *normed = CUDA::LayerNorm(
+        embeddings + i * D, input.gammaAttention, input.betaAttention, D,
+        TransformerInput::EPSILON_ATTENTION);
+    cudaMemcpy(layerNormedEmbeddings + i * D, normed, rowBytes,
+               cudaMemcpyDeviceToDevice);
+    cudaFree(normed);
   }
 
-  auto attentionResult = MultiHeadAttention(
-      layerNormedEmbeddings, // 2D (NUM_TOKENS x embedDim), flattened as 1D
+  double *attentionResult = MultiHeadAttention(
+      layerNormedEmbeddings, NUM_TOKENS, D, input.qWeights, input.kWeights,
+      input.vWeights, input.oWeights, TransformerInput::HEADS,
+      TransformerInput::HEAD_DIMENSION, input.oBiases, input.qBiases,
+      input.kBiases, input.vBiases);
 
-      NUM_TOKENS, TransformerInput::EMBEDDING_DIMENSION,
+  cudaFree(layerNormedEmbeddings);
 
-      input.qWeights, // 3D (heads x headDim x embedDim), flattened as 1D
-      input.kWeights, // 3D (heads x headDim x embedDim), flattened as 1D
-      input.vWeights, // 3D (heads x headDim x embedDim), flattened as 1D
-
-      input.oWeights, // 2D (embedDim x embedDim), flattened as 1D
-
-      TransformerInput::HEADS, TransformerInput::HEAD_DIMENSION,
-
-      input.oBiases, // oBiases
-      input.qBiases, // 2D (heads x headDim), flattened as 1D
-      input.kBiases, // 2D (heads x headDim), flattened as 1D
-      input.vBiases  // 2D (heads x headDim), flattened as 1D
-  );
-  // 2D (NUM_TOKENS x embedDim), flattened as 1D
-
-  std::vector<double> normedForMLP(NUM_TOKENS *
-                                   TransformerInput::EMBEDDING_DIMENSION);
-  // 2D (NUM_TOKENS x embedDim), flattened as 1D
+  double *normedForMLP;
+  cudaMalloc(&normedForMLP, static_cast<size_t>(NUM_TOKENS) * D * sizeof(double));
 
   for (int i = 0; i < NUM_TOKENS; i++) {
-    std::vector<double> origToken(
-        embeddings.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
-        embeddings.begin() + (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
-    // 1D
+    double *withResidual = CUDA::vectorCombine(
+        embeddings + i * D, attentionResult + i * D, D, add);
 
-    std::vector<double> attnToken(
-        attentionResult.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
-        attentionResult.begin() +
-            (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
-    // 1D
+    cudaMemcpy(attentionResult + i * D, withResidual, rowBytes,
+               cudaMemcpyDeviceToDevice);
 
-    auto withResidual = AddVectors(origToken, // 1D
-                                   attnToken  // 1D
-    );
-    // 1D
+    double *normed =
+        CUDA::LayerNorm(withResidual, input.gammaMLP, input.betaMLP, D,
+                        TransformerInput::EPSILON_MLP);
+    cudaFree(withResidual);
 
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
-      attentionResult[i * TransformerInput::EMBEDDING_DIMENSION + j] =
-          withResidual[j];
-    }
-
-    auto normed = LayerNorm(withResidual,   // 1D
-                            input.gammaMLP, // 1D
-                            input.betaMLP,  // 1D
-                            TransformerInput::EPSILON_MLP);
-    // 1D
-
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
-      normedForMLP[i * TransformerInput::EMBEDDING_DIMENSION + j] = normed[j];
-    }
+    cudaMemcpy(normedForMLP + i * D, normed, rowBytes, cudaMemcpyDeviceToDevice);
+    cudaFree(normed);
   }
 
-  auto MLPResult =
-      MLP(normedForMLP, // 2D (NUM_TOKENS x embedDim), flattened as 1D
+  double *MLPResult =
+      MLP(normedForMLP, NUM_TOKENS, D, input.l1Weights, input.l1Biases,
+          static_cast<int>(input.l1BiasesSize), input.l2Weights, input.l2Biases);
 
-          NUM_TOKENS, TransformerInput::EMBEDDING_DIMENSION,
-
-          input.l1Weights, // 2D (hidden x embedDim), flattened as 1D
-          input.l1Biases,  // 1D
-
-          input.l2Weights, // 2D (embedDim x hidden), flattened as 1D
-          input.l2Biases   // 1D
-      );
-  // 2D (NUM_TOKENS x embedDim), flattened as 1D
+  cudaFree(normedForMLP);
 
   for (int i = 0; i < NUM_TOKENS; i++) {
-    std::vector<double> attnToken(
-        attentionResult.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
-        attentionResult.begin() +
-            (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
-    // 1D
-
-    std::vector<double> mlpToken(
-        MLPResult.begin() + i * TransformerInput::EMBEDDING_DIMENSION,
-        MLPResult.begin() + (i + 1) * TransformerInput::EMBEDDING_DIMENSION);
-    // 1D
-
-    auto withResidual = AddVectors(attnToken, // 1D
-                                   mlpToken   // 1D
-    );
-    // 1D
-
-    for (int j = 0; j < TransformerInput::EMBEDDING_DIMENSION; j++) {
-      MLPResult[i * TransformerInput::EMBEDDING_DIMENSION + j] =
-          withResidual[j];
-    }
+    CUDA::vectorCombineInto(attentionResult + i * D, MLPResult + i * D,
+                            MLPResult + i * D, D, add);
   }
+
+  cudaFree(attentionResult);
 
   return MLPResult;
-  // 2D (NUM_TOKENS x embedDim), flattened as 1D
 }
 
 struct GptWeights {
-  const std::vector<TransformerInput> transformerWeights;
-  const std::vector<double> finalLayerNormWeights;
-  const std::vector<double> finalLayerNormBiases;
-  const std::vector<double> wpeWeights;
-  const std::vector<double> wteWeights;
+  // Host array; members point to device buffers.
+  TransformerInput *transformerWeights;
+  double *finalLayerNormWeights;
+  double *finalLayerNormBiases;
+  double *wpeWeights;
+  double *wteWeights;
+  size_t numTransformerLayers;
+  size_t finalLayerNormWeightsSize;
+  size_t finalLayerNormBiasesSize;
+  size_t wpeWeightsSize;
+  size_t wteWeightsSize;
 };
 
-GptWeights LoadWeights() {
+void InputVectorFromFilePtr(double *ptr, std::ifstream &stream, size_t count) {
+  double inp;
+  size_t idx = 0;
+  while (idx < count && stream >> inp) {
+    ptr[idx++] = inp;
+  }
+}
 
-  auto InputVectorFromFile = [](std::vector<double> &v, std::ifstream &stream,
-                                std::optional<size_t> maxCount =
-                                    std::nullopt) -> void {
-    double inp;
-    size_t count = 0;
-    while (stream >> inp) {
-      v.push_back(inp);
-      count++;
-      if (maxCount.has_value() && count >= maxCount.value())
-        break;
-    }
+
+GptWeights LoadWeights() {
+  constexpr size_t LAYERS = TransformerInput::LAYERS;
+  constexpr size_t D = TransformerInput::EMBEDDING_DIMENSION;
+  constexpr size_t HIDDEN = MLP_HIDDEN;
+  constexpr size_t FINAL_LN_SIZE = D;
+  constexpr size_t WPE_SIZE = N_CTX * D;
+  constexpr size_t WTE_SIZE = VOCAB_SIZE * D;
+  constexpr size_t ATTN_WEIGHT_SIZE = D * D;
+  constexpr size_t ATTN_BIAS_SIZE = D;
+  constexpr size_t L1_WEIGHT_SIZE = HIDDEN * D;
+  constexpr size_t L2_WEIGHT_SIZE = D * HIDDEN;
+
+  // Host array of layer configs; each weight/bias pointer inside is device memory.
+  TransformerInput *hostTransformerWeights = new TransformerInput[LAYERS];
+
+  auto copyToDevice = [](const double *hostPtr, size_t count) -> double * {
+    double *devPtr = nullptr;
+    cudaMalloc(&devPtr, count * sizeof(double));
+    cudaMemcpy(devPtr, hostPtr, count * sizeof(double), cudaMemcpyHostToDevice);
+    return devPtr;
   };
 
-  std::vector<TransformerInput> result;
-
-  double tempInput;
-
-  for (int i = 0; i < TransformerInput::LAYERS; i++) {
-
-    std::vector<double>
-        qWeights; // 3D (heads x embedDim x headDim), flattened as 1D
-    std::vector<double>
-        kWeights; // 3D (heads x embedDim x headDim), flattened as 1D
-    std::vector<double>
-        vWeights; // 3D (heads x embedDim x headDim), flattened as 1D
-
-    std::vector<double> qBiases; // 2D (heads x headDim), flattened as 1D
-    std::vector<double> kBiases; // 2D (heads x headDim), flattened as 1D
-    std::vector<double> vBiases; // 2D (heads x headDim), flattened as 1D
-
-    std::vector<double> oWeights; // 2D (embedDim x embedDim), flattened as 1D
-    std::vector<double> oBiases;  // 2D (embedDim x embedDim), flattened as 1D
-
-    std::vector<double> l1Weights; // 2D (embedDim x hidden), flattened as 1D
-    std::vector<double> l1Biases;  // 1D
-
-    std::vector<double> l2Weights; // 2D (hidden x embedDim), flattened as 1D
-    std::vector<double> l2Biases;  // 1D
-
-    std::vector<double> gammaAttention; // 1D
-    std::vector<double> gammaMLP;       // 1D
-
-    std::vector<double> betaAttention; // 1D
-    std::vector<double> betaMLP;       // 1D
+  // For each layer, load from disk to CPU and then copy to device
+  for (size_t i = 0; i < LAYERS; i++) {
+    double *gammaAttention = new double[D];
+    double *betaAttention = new double[D];
+    double *gammaMLP = new double[D];
+    double *betaMLP = new double[D];
+    double *l1Weights = new double[L1_WEIGHT_SIZE];
+    double *l1Biases = new double[HIDDEN];
+    double *l2Weights = new double[L2_WEIGHT_SIZE];
+    double *l2Biases = new double[D];
+    double *qWeights = new double[ATTN_WEIGHT_SIZE];
+    double *kWeights = new double[ATTN_WEIGHT_SIZE];
+    double *vWeights = new double[ATTN_WEIGHT_SIZE];
+    double *qBiases = new double[ATTN_BIAS_SIZE];
+    double *kBiases = new double[ATTN_BIAS_SIZE];
+    double *vBiases = new double[ATTN_BIAS_SIZE];
+    double *oWeights = new double[ATTN_WEIGHT_SIZE];
+    double *oBiases = new double[ATTN_BIAS_SIZE];
 
     // LayerNorm 1
-    std::ifstream ln1Weights("../weights/transformer.h." + std::to_string(i) +
-                             ".ln_1.weight.txt");
-    InputVectorFromFile(gammaAttention, ln1Weights);
-
-    std::ifstream ln1Biases("../weights/transformer.h." + std::to_string(i) +
-                            ".ln_1.bias.txt");
-    InputVectorFromFile(betaAttention, ln1Biases);
-
-    // LayerNorm 2
-    std::ifstream ln2Weights("../weights/transformer.h." + std::to_string(i) +
-                             ".ln_2.weight.txt");
-    InputVectorFromFile(gammaMLP, ln2Weights);
-    std::ifstream ln2Biases("../weights/transformer.h." + std::to_string(i) +
-                            ".ln_2.bias.txt");
-    InputVectorFromFile(betaMLP, ln2Biases);
-
-    // MLP Layer 1
-    std::ifstream mlpL1Weights("../weights/transformer.h." + std::to_string(i) +
-                               ".mlp.c_fc.weight.txt");
-    InputVectorFromFile(l1Weights, mlpL1Weights);
-
-    std::ifstream mlpL1Biases("../weights/transformer.h." + std::to_string(i) +
-                              ".mlp.c_fc.bias.txt");
-    InputVectorFromFile(l1Biases, mlpL1Biases);
-
-    // MLP Layer 2
-    std::ifstream mlpL2Weights("../weights/transformer.h." + std::to_string(i) +
-                               ".mlp.c_proj.weight.txt");
-    InputVectorFromFile(l2Weights, mlpL2Weights);
-
-    std::ifstream mlpL2Biases("../weights/transformer.h." + std::to_string(i) +
-                              ".mlp.c_proj.bias.txt");
-    InputVectorFromFile(l2Biases, mlpL2Biases);
-
-    // c_fc.weight is stored (in=768, out=hidden) row-major; ForwardPass
-    // expects (neurons x inputSize) = (hidden x 768). Transpose.
-    l1Weights = Transpose(l1Weights, N_EMBD, l1Biases.size());
-    // c_proj.weight is stored (in=hidden, out=768) row-major; ForwardPass
-    // expects (neurons x inputSize) = (768 x hidden). Transpose.
-    l2Weights = Transpose(l2Weights, l1Biases.size(), N_EMBD);
-
-    // Attention QKV weights and biases
-    std::ifstream qkvWeights("../weights/transformer.h." + std::to_string(i) +
-                             ".attn.c_attn.weight.txt");
-
-    for (int i = 0; i < N_EMBD; i++) {
-      InputVectorFromFile(qWeights, qkvWeights, N_EMBD);
-      InputVectorFromFile(kWeights, qkvWeights, N_EMBD);
-      InputVectorFromFile(vWeights, qkvWeights, N_EMBD);
+    {
+      std::ifstream ln1Weights("../weights/transformer.h." + std::to_string(i) +
+                               ".ln_1.weight.txt");
+      InputVectorFromFilePtr(gammaAttention, ln1Weights, D);
+      std::ifstream ln1Biases("../weights/transformer.h." + std::to_string(i) +
+                              ".ln_1.bias.txt");
+      InputVectorFromFilePtr(betaAttention, ln1Biases, D);
     }
 
-    // take care on using these  , these are transposed
-    qWeights = Transpose(qWeights, N_EMBD, N_EMBD);
-    kWeights = Transpose(kWeights, N_EMBD, N_EMBD);
-    vWeights = Transpose(vWeights, N_EMBD, N_EMBD);
+    // LayerNorm 2
+    {
+      std::ifstream ln2Weights("../weights/transformer.h." + std::to_string(i) +
+                               ".ln_2.weight.txt");
+      InputVectorFromFilePtr(gammaMLP, ln2Weights, D);
+      std::ifstream ln2Biases("../weights/transformer.h." + std::to_string(i) +
+                              ".ln_2.bias.txt");
+      InputVectorFromFilePtr(betaMLP, ln2Biases, D);
+    }
 
-    std::ifstream qkvBiases("../weights/transformer.h." + std::to_string(i) +
-                            ".attn.c_attn.bias.txt");
+    // MLP Layer 1
+    {
+      std::ifstream mlpL1Weights("../weights/transformer.h." +
+                                 std::to_string(i) + ".mlp.c_fc.weight.txt");
+      InputVectorFromFilePtr(l1Weights, mlpL1Weights, L1_WEIGHT_SIZE);
+      std::ifstream mlpL1Biases("../weights/transformer.h." + std::to_string(i) +
+                                ".mlp.c_fc.bias.txt");
+      InputVectorFromFilePtr(l1Biases, mlpL1Biases, HIDDEN);
+    }
 
-    InputVectorFromFile(qBiases, qkvBiases, N_EMBD);
-    InputVectorFromFile(kBiases, qkvBiases, N_EMBD);
-    InputVectorFromFile(vBiases, qkvBiases, N_EMBD);
+    // MLP Layer 2
+    {
+      std::ifstream mlpL2Weights("../weights/transformer.h." +
+                                 std::to_string(i) + ".mlp.c_proj.weight.txt");
+      InputVectorFromFilePtr(l2Weights, mlpL2Weights, L2_WEIGHT_SIZE);
+      std::ifstream mlpL2Biases("../weights/transformer.h." + std::to_string(i) +
+                                ".mlp.c_proj.bias.txt");
+      InputVectorFromFilePtr(l2Biases, mlpL2Biases, D);
+    }
+
+    // Transpose for device
+    {
+      double *l1T = CUDA::Transpose(l1Weights, D, HIDDEN);
+      delete[] l1Weights;
+      l1Weights = l1T;
+
+      double *l2T = CUDA::Transpose(l2Weights, HIDDEN, D);
+      delete[] l2Weights;
+      l2Weights = l2T;
+    }
+
+    // Attention QKV weights and biases
+    {
+      std::ifstream qkvWeightsFile("../weights/transformer.h." +
+                                   std::to_string(i) +
+                                   ".attn.c_attn.weight.txt");
+      size_t qIdx = 0, kIdx = 0, vIdx = 0;
+      for (size_t j = 0; j < D; j++) {
+        InputVectorFromFilePtr(qWeights + qIdx, qkvWeightsFile, D);
+        qIdx += D;
+        InputVectorFromFilePtr(kWeights + kIdx, qkvWeightsFile, D);
+        kIdx += D;
+        InputVectorFromFilePtr(vWeights + vIdx, qkvWeightsFile, D);
+        vIdx += D;
+      }
+
+      double *qT = CUDA::Transpose(qWeights, D, D);
+      delete[] qWeights;
+      qWeights = qT;
+      double *kT = CUDA::Transpose(kWeights, D, D);
+      delete[] kWeights;
+      kWeights = kT;
+      double *vT = CUDA::Transpose(vWeights, D, D);
+      delete[] vWeights;
+      vWeights = vT;
+
+      std::ifstream qkvBiases("../weights/transformer.h." + std::to_string(i) +
+                              ".attn.c_attn.bias.txt");
+      InputVectorFromFilePtr(qBiases, qkvBiases, D);
+      InputVectorFromFilePtr(kBiases, qkvBiases, D);
+      InputVectorFromFilePtr(vBiases, qkvBiases, D);
+    }
 
     // Attention output projection
-    std::ifstream attnOutputProjWeights("../weights/transformer.h." +
-                                        std::to_string(i) +
-                                        ".attn.c_proj.weight.txt");
-    InputVectorFromFile(oWeights, attnOutputProjWeights);
+    {
+      std::ifstream attnOutputProjWeights(
+          "../weights/transformer.h." + std::to_string(i) +
+          ".attn.c_proj.weight.txt");
+      InputVectorFromFilePtr(oWeights, attnOutputProjWeights, ATTN_WEIGHT_SIZE);
 
-    std::ifstream attnOutputProjBiases("../weights/transformer.h." +
-                                       std::to_string(i) +
-                                       ".attn.c_proj.bias.txt");
-    InputVectorFromFile(oBiases, attnOutputProjBiases);
+      std::ifstream attnOutputProjBiases("../weights/transformer.h." +
+                                         std::to_string(i) +
+                                         ".attn.c_proj.bias.txt");
+      InputVectorFromFilePtr(oBiases, attnOutputProjBiases, ATTN_BIAS_SIZE);
+    }
 
-    result.emplace_back(qWeights, kWeights, vWeights, qBiases, kBiases, vBiases,
-                        oWeights, oBiases, l1Weights, l1Biases, l2Weights,
-                        l2Biases, gammaAttention, gammaMLP, betaAttention,
-                        betaMLP);
+    // Move weights to device
+    double *gammaAttention_device = copyToDevice(gammaAttention, D);
+    double *betaAttention_device = copyToDevice(betaAttention, D);
+    double *gammaMLP_device = copyToDevice(gammaMLP, D);
+    double *betaMLP_device = copyToDevice(betaMLP, D);
+    double *l1Weights_device = copyToDevice(l1Weights, L1_WEIGHT_SIZE);
+    double *l1Biases_device = copyToDevice(l1Biases, HIDDEN);
+    double *l2Weights_device = copyToDevice(l2Weights, L2_WEIGHT_SIZE);
+    double *l2Biases_device = copyToDevice(l2Biases, D);
+    double *qWeights_device = copyToDevice(qWeights, ATTN_WEIGHT_SIZE);
+    double *kWeights_device = copyToDevice(kWeights, ATTN_WEIGHT_SIZE);
+    double *vWeights_device = copyToDevice(vWeights, ATTN_WEIGHT_SIZE);
+    double *qBiases_device = copyToDevice(qBiases, ATTN_BIAS_SIZE);
+    double *kBiases_device = copyToDevice(kBiases, ATTN_BIAS_SIZE);
+    double *vBiases_device = copyToDevice(vBiases, ATTN_BIAS_SIZE);
+    double *oWeights_device = copyToDevice(oWeights, ATTN_WEIGHT_SIZE);
+    double *oBiases_device = copyToDevice(oBiases, ATTN_BIAS_SIZE);
+
+    // Free host memory
+    delete[] gammaAttention;
+    delete[] betaAttention;
+    delete[] gammaMLP;
+    delete[] betaMLP;
+    delete[] l1Weights;
+    delete[] l1Biases;
+    delete[] l2Weights;
+    delete[] l2Biases;
+    delete[] qWeights;
+    delete[] kWeights;
+    delete[] vWeights;
+    delete[] qBiases;
+    delete[] kBiases;
+    delete[] vBiases;
+    delete[] oWeights;
+    delete[] oBiases;
+
+    hostTransformerWeights[i] = TransformerInput{
+        qWeights_device, ATTN_WEIGHT_SIZE, kWeights_device, ATTN_WEIGHT_SIZE,
+        vWeights_device, ATTN_WEIGHT_SIZE, qBiases_device, ATTN_BIAS_SIZE,
+        kBiases_device, ATTN_BIAS_SIZE, vBiases_device, ATTN_BIAS_SIZE,
+        oWeights_device, ATTN_WEIGHT_SIZE, oBiases_device, ATTN_BIAS_SIZE,
+        l1Weights_device, L1_WEIGHT_SIZE, l1Biases_device, HIDDEN,
+        l2Weights_device, L2_WEIGHT_SIZE, l2Biases_device, D,
+        gammaAttention_device, D, gammaMLP_device, D,
+        betaAttention_device, D, betaMLP_device, D};
   }
 
-  std::vector<double> finalLayerNormWeights, finalLayerNormBiases,
-      wpeWeightsVector, wteWeightsVector;
+  // Keep TransformerInput structs on host; weight buffers inside are on device.
+  // (Host must be able to index weights.transformerWeights[i].)
 
-  std::ifstream lnWeights("../weights/transformer.ln_f.weight.txt");
-  std::ifstream lnBiases("../weights/transformer.ln_f.bias.txt");
+  // Load final layer norm and embeddings to CPU
+  double *finalLayerNormWeights = new double[FINAL_LN_SIZE];
+  double *finalLayerNormBiases = new double[FINAL_LN_SIZE];
+  double *wpeWeights = new double[WPE_SIZE];
+  double *wteWeights = new double[WTE_SIZE];
 
-  std::ifstream wpeWeights("../weights/transformer.wpe.weight.txt");
-  std::ifstream wteWeights("../weights/transformer.wte.weight.txt");
+  {
+    std::ifstream lnWeights("../weights/transformer.ln_f.weight.txt");
+    InputVectorFromFilePtr(finalLayerNormWeights, lnWeights, FINAL_LN_SIZE);
+  }
+  {
+    std::ifstream lnBiases("../weights/transformer.ln_f.bias.txt");
+    InputVectorFromFilePtr(finalLayerNormBiases, lnBiases, FINAL_LN_SIZE);
+  }
+  {
+    std::ifstream wpeWeightsFile("../weights/transformer.wpe.weight.txt");
+    InputVectorFromFilePtr(wpeWeights, wpeWeightsFile, WPE_SIZE);
+    std::ifstream wteWeightsFile("../weights/transformer.wte.weight.txt");
+    InputVectorFromFilePtr(wteWeights, wteWeightsFile, WTE_SIZE);
+  }
 
-  InputVectorFromFile(finalLayerNormWeights, lnWeights);
-  InputVectorFromFile(finalLayerNormBiases, lnBiases);
+  // Copy to GPU
+  double *finalLayerNormWeights_device =
+      copyToDevice(finalLayerNormWeights, FINAL_LN_SIZE);
+  double *finalLayerNormBiases_device =
+      copyToDevice(finalLayerNormBiases, FINAL_LN_SIZE);
+  double *wpeWeights_device = copyToDevice(wpeWeights, WPE_SIZE);
+  double *wteWeights_device = copyToDevice(wteWeights, WTE_SIZE);
 
-  InputVectorFromFile(wpeWeightsVector, wpeWeights);
-  InputVectorFromFile(wteWeightsVector, wteWeights);
+  delete[] finalLayerNormWeights;
+  delete[] finalLayerNormBiases;
+  delete[] wpeWeights;
+  delete[] wteWeights;
 
-  return {result, finalLayerNormWeights, finalLayerNormBiases, wpeWeightsVector,
-          wteWeightsVector};
+  // Host structs whose members point into VRAM.
+  return {hostTransformerWeights,
+          finalLayerNormWeights_device,
+          finalLayerNormBiases_device,
+          wpeWeights_device,
+          wteWeights_device,
+          LAYERS,
+          FINAL_LN_SIZE,
+          FINAL_LN_SIZE,
+          WPE_SIZE,
+          WTE_SIZE};
 }
 
 // return next tokens id
 int GPT(const GptWeights &weights, const int numEmbeddings,
-        const std::vector<double> &embeddings) {
-  //
-  auto result =
+        const double *embeddings) {
+  double *result =
       Transformer(weights.transformerWeights[0], numEmbeddings, embeddings);
-  for (int i = 1; i < N_LAYER; i++)
-    result = Transformer(weights.transformerWeights[i], numEmbeddings, result);
-
-  //
-  std::span<double> lastTokenEmbedding(result.end() - N_EMBD, result.end());
-
-  auto layerNormedResult =
-      LayerNorm(lastTokenEmbedding, weights.finalLayerNormWeights,
-                weights.finalLayerNormBiases, EPSILON);
-
-  std::vector<double> distribution(VOCAB_SIZE);
-  for (int v = 0; v < VOCAB_SIZE; v++) {
-    std::span<const double> vocabRow(weights.wteWeights.data() + v * N_EMBD,
-                                     N_EMBD);
-    distribution[v] = DotProduct(layerNormedResult, vocabRow);
+  for (int i = 1; i < N_LAYER; i++) {
+    double *next =
+        Transformer(weights.transformerWeights[i], numEmbeddings, result);
+    cudaFree(result);
+    result = next;
   }
 
-  auto probDistribution = SoftMax(distribution);
+  const double *lastTokenEmbedding = result + (numEmbeddings - 1) * N_EMBD;
 
-  int maxProbTokenId =
-      std::max_element(probDistribution.begin(), probDistribution.end()) -
-      probDistribution.begin();
+  double *layerNormedResult =
+      CUDA::LayerNorm(lastTokenEmbedding, weights.finalLayerNormWeights,
+                      weights.finalLayerNormBiases, N_EMBD, EPSILON);
+
+  cudaFree(result);
+
+  // logits = wte @ lastToken  (VOCAB_SIZE x 1)
+  double *logits = CUDA::MatMul<double>(
+      weights.wteWeights, static_cast<size_t>(VOCAB_SIZE) * N_EMBD,
+      layerNormedResult, static_cast<size_t>(N_EMBD), VOCAB_SIZE, N_EMBD,
+      N_EMBD, 1);
+  cudaFree(layerNormedResult);
+
+  CUDA::SoftMaxInPlace(logits, VOCAB_SIZE);
+
+  std::vector<double> hostProbs(VOCAB_SIZE);
+  cudaMemcpy(hostProbs.data(), logits, VOCAB_SIZE * sizeof(double),
+             cudaMemcpyDeviceToHost);
+  cudaFree(logits);
+
+  int maxProbTokenId = static_cast<int>(
+      std::max_element(hostProbs.begin(), hostProbs.end()) - hostProbs.begin());
 
   return maxProbTokenId;
 }
@@ -689,16 +650,17 @@ int GetTokenIdFromToken(std::string token) {
   return it->second;
 }
 
-std::vector<double>
-GetEmbeddingFromTokenId(int tokenId, const std::vector<double> &wteWeights,
-                        const std::vector<double> &wpeWeights,
-                        const int position) {
-  return AddVectors(
-      std::vector<double>{wteWeights.begin() + tokenId * N_EMBD,
-                          wteWeights.begin() + (tokenId + 1) * N_EMBD},
-      std::vector<double>{wpeWeights.begin() + position * N_EMBD,
-                          wpeWeights.begin() + (position + 1) * N_EMBD});
+// Caller owns returned pointer (cudaFree). Size is always N_EMBD.
+double *GetEmbeddingFromTokenId(int tokenId, const double *wteWeights,
+                                const double *wpeWeights, const int position) {
+  auto add = [] __host__ __device__(const double &x, const double &y) -> double {
+    return x + y;
+  };
+  return CUDA::vectorCombine(wteWeights + tokenId * N_EMBD,
+                             wpeWeights + position * N_EMBD, N_EMBD, add);
 }
+
+
 
 std::vector<int> Tokenize(std::string input) {
 
@@ -708,6 +670,7 @@ std::vector<int> Tokenize(std::string input) {
   std::sregex_iterator end;
 
   std::vector<std::vector<std::string>> preChunksSplit;
+  
 
   for (; it != end; it++) {
     std::smatch match = *it;
@@ -766,20 +729,35 @@ std::vector<int> Tokenize(std::string input) {
   return result;
 }
 
-std::vector<double> GenerateEmbeddings(std::string input,
-                                       const std::vector<double> &wteWeights,
-                                       const std::vector<double> &wpeWeights) {
-  auto tokenIds = Tokenize(input);
 
-  std::vector<double> result;
-  for (int i = 0; i < tokenIds.size(); i++) {
-    auto embedding =
-        GetEmbeddingFromTokenId(tokenIds[i], wteWeights, wpeWeights, i);
-    std::copy(embedding.begin(), embedding.end(), std::back_inserter(result));
+// Caller owns returned pointer (cudaFree). *countTokens set to token count.
+double *GenerateEmbeddings(std::string input, const double *wteWeights,
+                           const double *wpeWeights, size_t &countTokens) {
+
+  auto tokenIds = Tokenize(input);
+  countTokens = tokenIds.size();
+
+  double *result;
+  cudaMalloc(&result, countTokens * N_EMBD * sizeof(double));
+
+  auto add = [] __host__ __device__(const double &x, const double &y) -> double {
+    return x + y;
+  };
+
+  for (size_t i = 0; i < countTokens; i++) {
+    double *embedding = CUDA::vectorCombine(
+        wteWeights + tokenIds[i] * N_EMBD,
+        wpeWeights + static_cast<int>(i) * N_EMBD, N_EMBD, add);
+
+    cudaMemcpy(result + i * N_EMBD, embedding, N_EMBD * sizeof(double),
+               cudaMemcpyDeviceToDevice);
+    cudaFree(embedding);
   }
 
   return result;
 }
+
+
 
 void LoadVocab() {
   using json = nlohmann::json;
@@ -829,30 +807,40 @@ int main() {
 
   while (true) {
 
-    //
     std::string input;
     std::cout << "\nEnter text: ";
-    std::getline(std::cin, input); // Reads until Enter is pressed
+    std::getline(std::cin, input);
     std::cout << "You entered: " << input << std::endl;
 
-    auto embeddings =
-        GenerateEmbeddings(input, weights.wteWeights, weights.wpeWeights);
+    size_t numTokens = 0;
+    double *embeddings =
+        GenerateEmbeddings(input, weights.wteWeights, weights.wpeWeights,
+                           numTokens);
 
     int tokenToGenerate = 20;
     while (tokenToGenerate--) {
-      auto nextToken = GPT(weights, embeddings.size() / N_EMBD, embeddings);
+      auto nextToken = GPT(weights, static_cast<int>(numTokens), embeddings);
       if (tokenToGenerate) {
-        auto nextTokenEmbedding = GetEmbeddingFromTokenId(
+        double *nextTokenEmbedding = GetEmbeddingFromTokenId(
             nextToken, weights.wteWeights, weights.wpeWeights,
-            embeddings.size() / N_EMBD);
-        std::copy(nextTokenEmbedding.begin(), nextTokenEmbedding.end(),
-                  std::back_inserter(embeddings));
+            static_cast<int>(numTokens));
+
+        double *grown;
+        cudaMalloc(&grown, (numTokens + 1) * N_EMBD * sizeof(double));
+        cudaMemcpy(grown, embeddings, numTokens * N_EMBD * sizeof(double),
+                   cudaMemcpyDeviceToDevice);
+        cudaMemcpy(grown + numTokens * N_EMBD, nextTokenEmbedding,
+                   N_EMBD * sizeof(double), cudaMemcpyDeviceToDevice);
+        cudaFree(nextTokenEmbedding);
+        cudaFree(embeddings);
+        embeddings = grown;
+        numTokens++;
       }
 
       std::cout << GetPrintableToken(GetTokenFromTokenId(nextToken));
       std::cout.flush();
-
-      //
     }
+
+    cudaFree(embeddings);
   }
 }
