@@ -17,6 +17,8 @@
 
 #include "include/json.hpp"
 
+#include "kernels/matmul.cuh"
+
 double GeluNew(double x) {
   return .5 * x * (1 + tanh(sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x)));
 }
@@ -100,27 +102,6 @@ std::vector<double> Transpose(std::span<const double> a, int n,
   return result;
 }
 
-std::vector<double> MatMul(std::span<const double> a, int aRows, int aCols,
-                           // a: 2d (aRows x aCols) flattened as 1d
-                           std::span<const double> b, int bRows,
-                           int bCols) // b: 2d (bRows x bCols) flattened as 1d
-{
-  assert(aCols == bRows);
-
-  std::vector<double> result(aRows * bCols,
-                             0); // 2d (aRows x bCols) flattened as 1d
-
-  for (int i = 0; i < aRows; i++) {
-    for (int j = 0; j < bCols; j++) {
-      for (int k = 0; k < bRows; k++) {
-        result[i * bCols + j] += a[i * aCols + k] * b[k * bCols + j];
-      }
-    }
-  }
-
-  return result;
-}
-
 std::vector<double> Attention(
     std::span<const double> embeddings, int NUM_TOKENS,
     int embedDim, // embeddings: 2d (NUM_TOKENS x embedDim) flattened as 1d
@@ -161,9 +142,8 @@ std::vector<double> Attention(
       Transpose(kProjections, NUM_TOKENS,
                 headDim); // 2d (headDim x NUM_TOKENS) flattened as 1d
 
-  auto qkTranspose =
-      MatMul(qProjections, NUM_TOKENS, headDim, kTranspose, headDim,
-             NUM_TOKENS); // 2d (NUM_TOKENS x NUM_TOKENS) flattened as 1d
+  std::vector<double> qkTranspose = CUDA::MatMul<double>(
+      qProjections, kTranspose, NUM_TOKENS, headDim, headDim, NUM_TOKENS);
 
   double dimensionsRoot = sqrt(headDim);
   for (auto &v : qkTranspose)
@@ -183,8 +163,8 @@ std::vector<double> Attention(
       qkTranspose[i * NUM_TOKENS + j] = softRow[j];
   }
 
-  return MatMul(qkTranspose, NUM_TOKENS, NUM_TOKENS, vProjections, NUM_TOKENS,
-                headDim); // 2d (NUM_TOKENS x headDim) flattened as 1d
+  return CUDA::MatMul<double>(qkTranspose, vProjections, NUM_TOKENS, NUM_TOKENS,
+                              NUM_TOKENS, headDim);
 }
 
 std::vector<double> MultiHeadAttention(
@@ -238,8 +218,7 @@ std::vector<double> MultiHeadAttention(
   }
 
   auto projectionResult =
-      MatMul(result, NUM_TOKENS, embedDim, oWeights, embedDim,
-             embedDim); // 2d (NUM_TOKENS x embedDim) flattened as 1d
+      CUDA::MatMul<double>(result, oWeights, NUM_TOKENS, embedDim, embedDim, embedDim);
 
   for (int i = 0; i < NUM_TOKENS; i++) {
     for (int j = 0; j < embedDim; j++) {
