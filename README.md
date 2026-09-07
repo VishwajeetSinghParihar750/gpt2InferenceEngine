@@ -1,89 +1,31 @@
 # GPT-2 Inference Engine
 
-A from-scratch C++ inference engine for [OpenAI GPT-2](https://github.com/openai/gpt-2) (small, 124M parameters).
+A from-scratch GPT-2 (small, 124M) inference engine — no PyTorch, no TensorFlow.
+The model runs on **CUDA**, with the transformer ops written as custom GPU kernels.
 
-No PyTorch. No CUDA. No ML frameworks. Just plain C++ and the standard library.
-
----
-
-## What it does
-
-You type a prompt. It generates text. That's it.
+You type a prompt. It generates text.
 
 ```
 Enter text: The quick brown fox
  jumped over the lazy dog and ran into the forest,
 ```
 
-Under the hood, every step is implemented by hand:
+---
 
-- **BPE tokenizer** — splits your input into tokens using the GPT-2 merge rules, loaded from `tokenizer.json`
-- **Token + positional embeddings** — looks up `wte` and `wpe`, adds them together
-- **12 transformer blocks** — each with pre-norm multi-head attention and a GELU MLP
-- **LM head** — projects the final hidden state against the vocabulary, picks the most likely next token
-- **Autoregressive loop** — appends each generated token and feeds it back in for the next one
+## What you need
+
+| Tool | Why |
+|------|-----|
+| **NVIDIA GPU + drivers** | Runs inference on CUDA |
+| **nvcc** (CUDA toolkit) | Compiles `main.cu` |
+| **Python 3.12+** | One-time weight export from Hugging Face |
+| **uv** (optional) | Easier Python deps — or use pip |
 
 ---
 
-## How it's built
-
-Weights are exported from Hugging Face as flat `.txt` files (one file per tensor), then loaded at runtime by the C++ binary. No binary model format, no serialization library.
-
-```
-Hugging Face GPT-2
-      ↓  (Python, once)
-modelLoader/main.py
-      ↓
-weights/*.txt          ← one file per parameter, space-separated floats
-      ↓  (C++, every run)
-inference/main.cc
-      ↓
-interactive text generation
-```
-
----
-
-## Project structure
-
-```
-gpt2InferenceEngine/
-├── inference/
-│   ├── main.cc          # everything: ops, tokenizer, transformer, main loop
-│   ├── constants.hh     # model hyperparameters
-│   ├── include/
-│   │   └── json.hpp     # single-header JSON (for tokenizer.json)
-│   └── tokenizer/
-│       └── tokenizer.json
-├── modelLoader/
-│   ├── main.py          # exports weights from Hugging Face
-│   ├── pyproject.toml
-│   └── uv.lock
-├── weights/             # generated — one .txt per tensor
-└── README.md
-```
-
----
-
-## Model spec (GPT-2 small)
-
-| Hyperparameter    | Value  |
-|-------------------|--------|
-| Vocabulary size   | 50,257 |
-| Embedding dim     | 768    |
-| Attention heads   | 12     |
-| Head dim          | 64     |
-| Transformer layers| 12     |
-| Context length    | 1,024  |
-| MLP hidden size   | 3,072  |
-| Activation        | GELU (new) |
-
----
-
-## Getting started
+## Quick start
 
 ### 1. Export weights (once)
-
-You need Python and [uv](https://docs.astral.sh/uv/) (or pip).
 
 ```bash
 cd modelLoader
@@ -91,7 +33,7 @@ uv sync
 uv run main.py
 ```
 
-This downloads `gpt2` from Hugging Face and writes one `.txt` file per parameter into `../weights/`. Takes a minute or two.
+This downloads `gpt2` from Hugging Face and writes one `.txt` file per tensor into `../weights/`.
 
 <details>
 <summary>Using pip instead of uv</summary>
@@ -104,23 +46,20 @@ python main.py
 
 </details>
 
-### 2. Build the inference engine
-
-Requires a C++20 compiler (g++ or clang++). No other dependencies.
+### 2. Build
 
 ```bash
 cd inference
-g++ -std=c++20 -O2 -o gpt2 main.cc
+nvcc -std=c++20 -O3 --extended-lambda --expt-relaxed-constexpr -o gpt2 main.cu
 ```
 
 ### 3. Run
 
+Run from the `inference/` folder so `../weights/` resolves correctly:
+
 ```bash
-# run from the inference/ directory so ../weights/ resolves correctly
 ./gpt2
 ```
-
-You'll see weight and vocab loading messages, then an interactive prompt:
 
 ```
 loading weights ...
@@ -131,39 +70,96 @@ vocab loaded...
 Enter text: Once upon a time
 ```
 
-It generates 20 tokens per prompt, then loops back for another input.
+It generates 20 tokens per prompt, then asks for another.
 
 ---
 
-## Implementation notes
+## How it works
 
-All ops live in `inference/main.cc` and use `std::vector<double>` with flat 1D layouts for matrices.
+```
+Hugging Face GPT-2
+      ↓  (Python, once)
+modelLoader/main.py
+      ↓
+weights/*.txt          ← one file per parameter
+      ↓  (CUDA, every run)
+inference/main.cu + kernels/
+      ↓
+interactive text generation
+```
 
-| Function | What it does |
-|---|---|
-| `LayerNorm` | Mean/variance normalize, then scale + shift |
-| `SoftMax` | Numerically stable (max subtraction) |
-| `MatMul` | Naive triple loop |
-| `Transpose` | In-place reshape for weight files |
-| `Attention` | Single-head: Q/K/V projections → scaled dot-product → causal mask → softmax → weighted V |
-| `MultiHeadAttention` | Runs 12 heads, concatenates, projects through `c_proj` |
-| `MLP` | `c_fc` (768→3072) + GELU → `c_proj` (3072→768) |
-| `Transformer` | Pre-norm attn block + residual, pre-norm MLP block + residual |
-| `GPT` | Stacks all 12 transformer blocks, final layer norm, dot against `wte` for logits |
-| `Tokenize` | Regex chunking + BPE merge loop (GPT-2 rules from `tokenizer.json`) |
-| `LoadWeights` | Reads all 12 layers + embeddings + final LN from `../weights/` |
-| `LoadVocab` | Parses `tokenizer.json` for vocab and merge table |
+Pipeline, all hand-written:
 
-Weight files follow the Hugging Face naming convention, e.g. `transformer.h.0.attn.c_attn.weight.txt`. The Q/K/V weights are interleaved in a single `c_attn` file and split at load time.
+1. **BPE tokenizer** — GPT-2 merge rules from `tokenizer.json`
+2. **Embeddings** — token (`wte`) + position (`wpe`)
+3. **12 transformer blocks** — pre-norm attention + GELU MLP (on GPU)
+4. **LM head** — final layer norm, project to vocab, greedy next token
+5. **Loop** — append token and generate the next one
 
 ---
 
-## Prerequisites
+## Project layout
 
-| Tool | Version |
+```
+gpt2InferenceEngine/
+├── inference/
+│   ├── main.cu              # tokenizer, transformer, weight load, main loop
+│   ├── constants.hh         # model hyperparameters
+│   ├── kernels/             # CUDA ops
+│   │   ├── matmul.cuh
+│   │   ├── layerNorm.cuh
+│   │   ├── softmax.cuh
+│   │   ├── transpose.cuh
+│   │   ├── causalMask.cuh
+│   │   ├── packHead.cuh
+│   │   ├── forwardPass.cuh  # MLP linear + optional GELU
+│   │   └── ...
+│   └── include/
+│       └── json.hpp         # tokenizer.json parsing
+├── modelLoader/
+│   └── main.py              # export HF weights → ../weights/
+├── weights/                 # generated (gitignored)
+└── README.md
+```
+
+---
+
+## Model (GPT-2 small)
+
+| | |
 |---|---|
-| g++ / clang++ | C++20 support |
-| Python | 3.12+ |
-| uv (optional) | any recent |
+| Vocabulary | 50,257 |
+| Embedding dim | 768 |
+| Heads | 12 (head dim 64) |
+| Layers | 12 |
+| Context | 1,024 |
+| MLP hidden | 3,072 |
+| Activation | GELU (tanh approx) |
+| Precision | `double` on GPU |
 
-No CUDA, no BLAS, no Boost, nothing else.
+---
+
+## CUDA kernels (what lives where)
+
+High-level GPT logic stays in `main.cu`. Math runs in `kernels/`:
+
+| Kernel / helper | Role |
+|---|---|
+| `MatMul` | Tiled matrix multiply |
+| `LayerNorm` | Mean/var normalize + scale/shift |
+| `SoftMax` / `SoftMaxRows` | Stable softmax (1D or per row) |
+| `Transpose` | Matrix transpose |
+| `causalMask` | Mask future tokens in attention |
+| `packHead` | Write one attention head into the concat buffer |
+| `ForwardPass` | Linear layer (+ GELU for MLP) |
+| `vectorCombine` / `vectorMap` / `vectorReduction` | Elementwise ops and reductions |
+
+Weights use Hugging Face names, e.g. `transformer.h.0.attn.c_attn.weight.txt`. Q/K/V are interleaved in `c_attn` and split when loading.
+
+---
+
+## Notes
+
+- Build and run from `inference/` so paths to `../weights/` and the tokenizer stay correct.
+- First launch loads all weight `.txt` files — that can take a minute; generation is separate from load time.
+- This is a learning / from-scratch engine, not a production serving stack.
