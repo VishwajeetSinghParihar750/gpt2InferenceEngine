@@ -1,3 +1,23 @@
 CompileFlags:
   Add:
     - -std=c++20
+
+---
+
+If:
+  PathMatch: .*\.cuh
+
+CompileFlags:
+  Add:
+    - -xcuda
+    - --cuda-host-only
+
+---
+
+If:
+  PathMatch: .*\.cu
+
+CompileFlags:
+  Add:
+    - -xcuda
+    - --cuda-host-only
