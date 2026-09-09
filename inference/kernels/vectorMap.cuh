@@ -5,6 +5,8 @@
 #include <driver_types.h>
 #include <iostream>
 
+#include "../classes/cudaBuffer.cuh"
+
 namespace CUDA {
 
 const int vecMapThreadsPerBlock = 1024;
@@ -16,16 +18,13 @@ __global__ void vectorMapKernel(const T *a, T *b, int n, Op op) {
     b[i] = op(a[i]);
 }
 
-// op needs to be __host__ __device__
-// Caller owns the returned pointer (cudaFree).
 template <typename T, typename Op>
-T *vectorMap(const T *da, int n, Op op) {
-
-  T *db;
-  cudaMalloc(&db, n * sizeof(T));
+CudaBuffer<T> vectorMap(const CudaBuffer<T> &da, Op op) {
+  const int n = static_cast<int>(da.n);
+  CudaBuffer<T> db(da.n);
 
   vectorMapKernel<<<(n + vecMapThreadsPerBlock - 1) / vecMapThreadsPerBlock,
-                    vecMapThreadsPerBlock>>>(da, db, n, op);
+                    vecMapThreadsPerBlock>>>(da.ptr, db.ptr, n, op);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -34,7 +33,6 @@ T *vectorMap(const T *da, int n, Op op) {
   }
 
   cudaDeviceSynchronize();
-
   return db;
 }
 
@@ -45,14 +43,13 @@ __global__ void vectorMapInPlaceKernel(T *a, int n, Op op) {
     a[i] = op(a[i]);
 }
 
-// op needs to be __host__ __device__
-// Mutates da in place and returns it.
 template <typename T, typename Op>
-T *vectorMapInPlace(T *da, int n, Op op) {
+void vectorMapInPlace(CudaBuffer<T> &da, Op op) {
+  const int n = static_cast<int>(da.n);
 
   vectorMapInPlaceKernel<<<(n + vecMapThreadsPerBlock - 1) /
                                vecMapThreadsPerBlock,
-                           vecMapThreadsPerBlock>>>(da, n, op);
+                           vecMapThreadsPerBlock>>>(da.ptr, n, op);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -61,8 +58,6 @@ T *vectorMapInPlace(T *da, int n, Op op) {
   }
 
   cudaDeviceSynchronize();
-
-  return da;
 }
 
 }; // namespace CUDA
