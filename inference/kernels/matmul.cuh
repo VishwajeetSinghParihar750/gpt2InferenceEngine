@@ -8,12 +8,13 @@
 #include <driver_types.h>
 #include <iostream>
 
+#include "../classes/cudaBuffer.cuh"
+
 namespace CUDA {
 
 const int tileRows = 32;
 const int tileCols = tileRows;
 
-// C[an x bm] = A[an x am] * B[bn x bm], requires am == bn.
 template <typename T>
 __global__ void matMulKernel(const T *a, const T *b, T *c, int an, int am,
                              int bn, int bm) {
@@ -49,22 +50,23 @@ __global__ void matMulKernel(const T *a, const T *b, T *c, int an, int am,
     c[row * bm + col] = sum;
 }
 
-// Caller owns the returned pointer (cudaFree).
 template <typename T>
-T *MatMul(const T *da, size_t aSize, const T *db, size_t bSize, const int an,
-          const int am, const int bn, const int bm) {
+CudaBuffer<T> MatMul(const CudaBuffer<T> &da, const CudaBuffer<T> &db,
+                     const int an, const int am, const int bn, const int bm) {
 
   assert(am == bn);
+  assert(da.n == static_cast<size_t>(an) * am);
+  assert(db.n == static_cast<size_t>(bn) * bm);
 
-  T *dc;
-  cudaMalloc(&dc, static_cast<size_t>(an) * bm * sizeof(T));
-  cudaMemset(dc, 0, static_cast<size_t>(an) * bm * sizeof(T));
+  CudaBuffer<T> dc(static_cast<size_t>(an) * bm);
+  dc.zero();
 
   dim3 threadsPerBlock(tileCols, tileRows);
   dim3 blocksPerGrid((bm + threadsPerBlock.x - 1) / threadsPerBlock.x,
                      (an + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-  matMulKernel<<<blocksPerGrid, threadsPerBlock>>>(da, db, dc, an, am, bn, bm);
+  matMulKernel<<<blocksPerGrid, threadsPerBlock>>>(da.ptr, db.ptr, dc.ptr, an,
+                                                   am, bn, bm);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -73,7 +75,6 @@ T *MatMul(const T *da, size_t aSize, const T *db, size_t bSize, const int an,
   }
 
   cudaDeviceSynchronize();
-
   return dc;
 }
 

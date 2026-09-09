@@ -1,16 +1,18 @@
 #pragma once
 
+#include <cassert>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <iostream>
 #include <math_constants.h>
 
+#include "../classes/cudaBuffer.cuh"
+
 namespace CUDA {
 
 const int causalMaskThreadsPerBlock = 1024;
 
-// scores: NUM_TOKENS x NUM_TOKENS row-major. Sets scores[i, j] = -inf for j > i.
 template <typename T>
 __global__ void causalMaskKernel(T *scores, int numTokens) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -19,18 +21,17 @@ __global__ void causalMaskKernel(T *scores, int numTokens) {
     int i = idx / numTokens;
     int j = idx % numTokens;
     if (j > i)
-      scores[idx] = -CUDART_INF; // device -inf (double)
+      scores[idx] = -CUDART_INF;
   }
 }
 
-// Mutates scores in place.
 template <typename T>
-T *causalMask(T *scores, int numTokens) {
-
+void causalMask(CudaBuffer<T> &scores, int numTokens) {
+  assert(scores.n == static_cast<size_t>(numTokens) * numTokens);
   const int total = numTokens * numTokens;
   causalMaskKernel<<<(total + causalMaskThreadsPerBlock - 1) /
                          causalMaskThreadsPerBlock,
-                     causalMaskThreadsPerBlock>>>(scores, numTokens);
+                     causalMaskThreadsPerBlock>>>(scores.ptr, numTokens);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -39,8 +40,6 @@ T *causalMask(T *scores, int numTokens) {
   }
 
   cudaDeviceSynchronize();
-
-  return scores;
 }
 
 }; // namespace CUDA

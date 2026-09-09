@@ -5,6 +5,8 @@
 #include <numeric>
 #include <vector>
 
+#include "../classes/cudaBuffer.cuh"
+
 namespace CUDA {
 
 const int perBlock = 1024;
@@ -35,43 +37,37 @@ __global__ void vectorReductionBlock(const double *a, double *b, int n, Op op,
     b[blockIdx.x] = data[threadIdx.x];
 }
 
-// kernelOp needs to be __host__ __device__; accumulateOp is host-only.
 template <typename KernelOp, typename AccumulateOp>
-double vectorReduction(const double *a, int n, KernelOp kernelOp,
+double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
                        AccumulateOp accumulateOp, double kernelDefaultValue,
                        double accumulateDefaultValue) {
 
+  const int n = static_cast<int>(a.n);
   const int blocks = (n + perBlock - 1) / perBlock;
 
-  double *deviceResult;
-  cudaMalloc(&deviceResult, blocks * sizeof(double));
+  CudaBuffer<double> deviceResult(static_cast<size_t>(blocks));
 
-  vectorReductionBlock<<<blocks, perBlock>>>(a, deviceResult, n, kernelOp,
-                                             kernelDefaultValue);
+  vectorReductionBlock<<<blocks, perBlock>>>(a.ptr, deviceResult.ptr, n,
+                                             kernelOp, kernelDefaultValue);
 
   std::vector<double> result(blocks);
-  cudaMemcpy(result.data(), deviceResult, blocks * sizeof(double),
-             cudaMemcpyDeviceToHost);
-
-  cudaFree(deviceResult);
+  deviceResult.copyToHost(result.data());
 
   return std::accumulate(result.begin(), result.end(), accumulateDefaultValue,
                          accumulateOp);
 }
 
-// accumulateDefaultValue defaults to kernelDefaultValue.
 template <typename KernelOp, typename AccumulateOp>
-double vectorReduction(const double *a, int n, KernelOp kernelOp,
+double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
                        AccumulateOp accumulateOp, double kernelDefaultValue) {
-  return vectorReduction(a, n, kernelOp, accumulateOp, kernelDefaultValue,
+  return vectorReduction(a, kernelOp, accumulateOp, kernelDefaultValue,
                          kernelDefaultValue);
 }
 
-// accumulateOp and its defaultValue default to the kernel's.
 template <typename KernelOp>
-double vectorReduction(const double *a, int n, KernelOp kernelOp,
+double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
                        double defaultValue) {
-  return vectorReduction(a, n, kernelOp, kernelOp, defaultValue, defaultValue);
+  return vectorReduction(a, kernelOp, kernelOp, defaultValue, defaultValue);
 }
 
 }; // namespace CUDA

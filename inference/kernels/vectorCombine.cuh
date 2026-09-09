@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cassert>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <iostream>
+
+#include "../classes/cudaBuffer.cuh"
 
 namespace CUDA {
 
@@ -17,16 +20,15 @@ __global__ void vectorCombineKernel(const T *a, const T *b, T *c, int n,
     c[i] = op(a[i], b[i]);
 }
 
-// op needs to be __host__
-// Caller owns the returned pointer (cudaFree).
 template <typename T, typename Op>
-T *vectorCombine(const T *da, const T *db, int n, Op op) {
-
-  T *dc;
-  cudaMalloc(&dc, n * sizeof(T));
+CudaBuffer<T> vectorCombine(const CudaBuffer<T> &da, const CudaBuffer<T> &db,
+                            Op op) {
+  assert(da.n == db.n);
+  const int n = static_cast<int>(da.n);
+  CudaBuffer<T> dc(da.n);
 
   vectorCombineKernel<<<(n + vecAddThreadsPerBlock - 1) / vecAddThreadsPerBlock,
-                        vecAddThreadsPerBlock>>>(da, db, dc, n, op);
+                        vecAddThreadsPerBlock>>>(da.ptr, db.ptr, dc.ptr, n, op);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -35,16 +37,17 @@ T *vectorCombine(const T *da, const T *db, int n, Op op) {
   }
 
   cudaDeviceSynchronize();
-
   return dc;
 }
 
-// Writes into dc (must be device memory of length n). Returns dc.
 template <typename T, typename Op>
-T *vectorCombineInto(const T *da, const T *db, T *dc, int n, Op op) {
+void vectorCombineInto(const CudaBuffer<T> &da, const CudaBuffer<T> &db,
+                       CudaBuffer<T> &dc, Op op) {
+  assert(da.n == db.n && da.n == dc.n);
+  const int n = static_cast<int>(da.n);
 
   vectorCombineKernel<<<(n + vecAddThreadsPerBlock - 1) / vecAddThreadsPerBlock,
-                        vecAddThreadsPerBlock>>>(da, db, dc, n, op);
+                        vecAddThreadsPerBlock>>>(da.ptr, db.ptr, dc.ptr, n, op);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -53,11 +56,8 @@ T *vectorCombineInto(const T *da, const T *db, T *dc, int n, Op op) {
   }
 
   cudaDeviceSynchronize();
-
-  return dc;
 }
 
-// mat: rows x cols row-major. Adds bias[col] to every row in place.
 template <typename T>
 __global__ void addRowBiasKernel(T *mat, const T *bias, int rows, int cols) {
   int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -66,10 +66,13 @@ __global__ void addRowBiasKernel(T *mat, const T *bias, int rows, int cols) {
 }
 
 template <typename T>
-T *addRowBias(T *mat, const T *bias, int rows, int cols) {
+void addRowBias(CudaBuffer<T> &mat, const CudaBuffer<T> &bias, int rows,
+                int cols) {
+  assert(mat.n == static_cast<size_t>(rows) * cols);
+  assert(bias.n == static_cast<size_t>(cols));
   const int total = rows * cols;
   addRowBiasKernel<<<(total + vecAddThreadsPerBlock - 1) / vecAddThreadsPerBlock,
-                     vecAddThreadsPerBlock>>>(mat, bias, rows, cols);
+                     vecAddThreadsPerBlock>>>(mat.ptr, bias.ptr, rows, cols);
 
   cudaError_t cudaError = cudaGetLastError();
   if (cudaError != cudaSuccess) {
@@ -78,8 +81,6 @@ T *addRowBias(T *mat, const T *bias, int rows, int cols) {
   }
 
   cudaDeviceSynchronize();
-
-  return mat;
 }
 
 }; // namespace CUDA
