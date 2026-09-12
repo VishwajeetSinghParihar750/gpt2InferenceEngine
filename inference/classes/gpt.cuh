@@ -234,8 +234,9 @@ class Gpt2 {
 
     auto result = transformer.loop(embeddings, numEmbeddings);
 
+    int resultTokens = static_cast<int>(result.n / N_EMBD);
     auto lastToken =
-        result.slice(static_cast<size_t>(numEmbeddings - 1) * N_EMBD, N_EMBD);
+        result.slice(static_cast<size_t>(resultTokens - 1) * N_EMBD, N_EMBD);
 
     auto layerNormedResult =
         CUDA::LayerNorm(lastToken, ln_f.gamma, ln_f.beta, EPSILON);
@@ -293,8 +294,17 @@ public:
 
   void generate(std::string input, int n) {
 
+    transformer.resetKvCache();
+
     size_t numTokens = 0;
-    auto embeddings = this->tokenizer.generateEmbeddings(input, numTokens);
+    auto promptEmbeddings =
+        this->tokenizer.generateEmbeddings(input, numTokens);
+
+    CudaBuffer<double> embeddings;
+    embeddings.reserve(static_cast<size_t>(N_CTX) * N_EMBD);
+    embeddings.resize(numTokens * N_EMBD);
+    embeddings.copyFrom(promptEmbeddings);
+    promptEmbeddings = CudaBuffer<double>();
 
     int tokenToGenerate = n;
     while (tokenToGenerate--) {
@@ -305,10 +315,8 @@ public:
         auto nextTokenEmbedding = tokenizer.embeddingFromTokenId(
             nextToken, static_cast<int>(numTokens));
 
-        CudaBuffer<double> grown((numTokens + 1) * N_EMBD);
-        grown.copyFrom(embeddings);
-        grown.copyFrom(nextTokenEmbedding, numTokens * N_EMBD);
-        embeddings = std::move(grown);
+        embeddings.resize((numTokens + 1) * N_EMBD);
+        embeddings.copyFrom(nextTokenEmbedding, numTokens * N_EMBD);
         numTokens++;
       }
 

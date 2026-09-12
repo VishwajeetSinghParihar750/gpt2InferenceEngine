@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <fstream>
@@ -21,18 +22,24 @@
 #include "cudaBuffer.cuh"
 #include "weights.cuh"
 
-class Transformer {
+struct Transformer {
 
   std::vector<BlockWeights> weights;
-  // kvCache
-  CudaBuffer<double> kCache[12], vCache[12];
+  // kvCache: per layer, head-major [head][pos][headDim]
+  CudaBuffer<double> kCache[N_LAYER], vCache[N_LAYER];
+  int kvCacheLen = 0;
 
   CudaBuffer<double> Attention(const CudaBuffer<double> &embeddings,
-                               int blockIdx, int headIdx, int NUM_TOKENS) {
+                               int blockIdx, int headIdx, int totalTokens) {
     constexpr int embedDim = N_EMBD;
     constexpr int headDim = N_EMBD / N_HEAD;
     const auto &attn = weights[blockIdx].attn;
     const int weightBlockSize = embedDim * headDim;
+
+    const int cached = kvCacheLen;
+    const int newCount = totalTokens - cached;
+    assert(newCount > 0);
+    assert(static_cast<size_t>(newCount) * embedDim == embeddings.n);
 
     auto qWeights = attn.q.slice(static_cast<size_t>(headIdx) * weightBlockSize,
                                  weightBlockSize);
@@ -50,9 +57,9 @@ class Transformer {
     auto project = [&](const CudaBuffer<double> &w,
                        const CudaBuffer<double> &biases) -> CudaBuffer<double> {
       auto wT = CUDA::Transpose(w, headDim, embedDim);
-      auto proj = CUDA::MatMul<double>(embeddings, wT, NUM_TOKENS, embedDim,
+      auto proj = CUDA::MatMul<double>(embeddings, wT, newCount, embedDim,
                                        embedDim, headDim);
-      CUDA::addRowBias(proj, biases, NUM_TOKENS, headDim);
+      CUDA::addRowBias(proj, biases, newCount, headDim);
       return proj;
     };
 
@@ -60,10 +67,22 @@ class Transformer {
     auto kProjections = project(kWeights, kBiases);
     auto vProjections = project(vWeights, vBiases);
 
-    auto kTranspose = CUDA::Transpose(kProjections, NUM_TOKENS, headDim);
+    const size_t headBase =
+        static_cast<size_t>(headIdx) * N_CTX * headDim;
+    kCache[blockIdx].copyFrom(kProjections,
+                              headBase + static_cast<size_t>(cached) * headDim);
+    vCache[blockIdx].copyFrom(vProjections,
+                              headBase + static_cast<size_t>(cached) * headDim);
+
+    auto kAll = kCache[blockIdx].slice(
+        headBase, static_cast<size_t>(totalTokens) * headDim);
+    auto vAll = vCache[blockIdx].slice(
+        headBase, static_cast<size_t>(totalTokens) * headDim);
+
+    auto kTranspose = CUDA::Transpose(kAll, totalTokens, headDim);
 
     auto qkTranspose = CUDA::MatMul<double>(
-        qProjections, kTranspose, NUM_TOKENS, headDim, headDim, NUM_TOKENS);
+        qProjections, kTranspose, newCount, headDim, headDim, totalTokens);
 
     double dimensionsRoot = sqrt(headDim);
 
@@ -73,31 +92,32 @@ class Transformer {
                              return v;
                            });
 
-    CUDA::causalMask(qkTranspose, NUM_TOKENS);
-    CUDA::SoftMaxRows(qkTranspose, NUM_TOKENS, NUM_TOKENS);
+    CUDA::causalMask(qkTranspose, newCount, totalTokens, cached);
+    CUDA::SoftMaxRows(qkTranspose, newCount, totalTokens);
 
-    return CUDA::MatMul<double>(qkTranspose, vProjections, NUM_TOKENS,
-                                NUM_TOKENS, NUM_TOKENS, headDim);
+    return CUDA::MatMul<double>(qkTranspose, vAll, newCount, totalTokens,
+                                totalTokens, headDim);
   }
 
   CudaBuffer<double> MultiHeadAttention(const CudaBuffer<double> &embeddings,
-                                        int blockIdx, int NUM_TOKENS) {
+                                        int blockIdx, int totalTokens) {
     constexpr int embedDim = N_EMBD;
     constexpr int headDim = N_EMBD / N_HEAD;
     const auto &attn = weights[blockIdx].attn;
+    const int newCount = totalTokens - kvCacheLen;
 
-    CudaBuffer<double> packed(static_cast<size_t>(NUM_TOKENS) * embedDim);
+    CudaBuffer<double> packed(static_cast<size_t>(newCount) * embedDim);
     packed.zero();
 
     for (int h = 0; h < N_HEAD; h++) {
-      auto curResult = Attention(embeddings, blockIdx, h, NUM_TOKENS);
-      CUDA::packHead(curResult, packed, NUM_TOKENS, headDim, embedDim, h);
+      auto curResult = Attention(embeddings, blockIdx, h, totalTokens);
+      CUDA::packHead(curResult, packed, newCount, headDim, embedDim, h);
     }
 
-    auto projectionResult = CUDA::MatMul<double>(packed, attn.o, NUM_TOKENS,
+    auto projectionResult = CUDA::MatMul<double>(packed, attn.o, newCount,
                                                  embedDim, embedDim, embedDim);
 
-    CUDA::addRowBias(projectionResult, attn.ob, NUM_TOKENS, embedDim);
+    CUDA::addRowBias(projectionResult, attn.ob, newCount, embedDim);
     return projectionResult;
   }
 
@@ -120,19 +140,20 @@ class Transformer {
     return result;
   }
 
+  // embeddings: only the new tokens for this forward (length newCount)
   CudaBuffer<double> loopBlock(int blockIdx,
                                const CudaBuffer<double> &embeddings,
-                               int NUM_TOKENS) {
+                               int totalTokens) {
     constexpr int D = N_EMBD;
     const auto &input = weights[blockIdx];
+    const int newCount = totalTokens - kvCacheLen;
 
     auto add = [] __host__ __device__(const double &x, const double &y)
         -> double { return x + y; };
 
-    CudaBuffer<double> layerNormedEmbeddings(static_cast<size_t>(NUM_TOKENS) *
-                                             D);
+    CudaBuffer<double> layerNormedEmbeddings(static_cast<size_t>(newCount) * D);
 
-    for (int i = 0; i < NUM_TOKENS; i++) {
+    for (int i = 0; i < newCount; i++) {
       auto token = embeddings.slice(static_cast<size_t>(i) * D, D);
       auto normed =
           CUDA::LayerNorm(token, input.ln1.gamma, input.ln1.beta, EPSILON);
@@ -140,13 +161,13 @@ class Transformer {
     }
 
     auto attentionResult =
-        MultiHeadAttention(layerNormedEmbeddings, blockIdx, NUM_TOKENS);
+        MultiHeadAttention(layerNormedEmbeddings, blockIdx, totalTokens);
 
     layerNormedEmbeddings = CudaBuffer<double>();
 
-    CudaBuffer<double> normedForMLP(static_cast<size_t>(NUM_TOKENS) * D);
+    CudaBuffer<double> normedForMLP(static_cast<size_t>(newCount) * D);
 
-    for (int i = 0; i < NUM_TOKENS; i++) {
+    for (int i = 0; i < newCount; i++) {
       auto embRow = embeddings.slice(static_cast<size_t>(i) * D, D);
       auto attnRow = attentionResult.slice(static_cast<size_t>(i) * D, D);
       auto withResidual = CUDA::vectorCombine(embRow, attnRow, add);
@@ -160,11 +181,11 @@ class Transformer {
       normedForMLP.copyFrom(normed, static_cast<size_t>(i) * D);
     }
 
-    auto MLPResult = MLP(normedForMLP, blockIdx, NUM_TOKENS);
+    auto MLPResult = MLP(normedForMLP, blockIdx, newCount);
 
     normedForMLP = CudaBuffer<double>();
 
-    for (int i = 0; i < NUM_TOKENS; i++) {
+    for (int i = 0; i < newCount; i++) {
       auto attnRow = attentionResult.slice(static_cast<size_t>(i) * D, D);
       auto mlpRow = MLPResult.slice(static_cast<size_t>(i) * D, D);
       CUDA::vectorCombineInto(attnRow, mlpRow, mlpRow, add);
@@ -345,10 +366,23 @@ public:
 
   CudaBuffer<double> loop(const CudaBuffer<double> &embeddings,
                           int NUM_TOKENS) {
-    auto result = loopBlock(0, embeddings, NUM_TOKENS);
+    const int cached = kvCacheLen;
+    const int newCount = NUM_TOKENS - cached;
+    assert(newCount > 0);
+    assert(NUM_TOKENS <= N_CTX);
+
+    auto newEmbeddings = embeddings.slice(
+        static_cast<size_t>(cached) * N_EMBD,
+        static_cast<size_t>(newCount) * N_EMBD);
+
+    auto result = loopBlock(0, newEmbeddings, NUM_TOKENS);
     for (int i = 1; i < N_LAYER; i++) {
       result = loopBlock(i, result, NUM_TOKENS);
     }
+
+    kvCacheLen = NUM_TOKENS;
     return result;
   }
+
+  void resetKvCache() { kvCacheLen = 0; }
 };
