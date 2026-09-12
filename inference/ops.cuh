@@ -281,9 +281,9 @@ void vectorMapInPlace(CudaBuffer<T> &da, Op op) {
 // --- vector reduction ---
 
 template <typename Op>
-__global__ void vectorReductionBlock(const double *a, double *b, int n, Op op,
-                                     double defaultValue) {
-  __shared__ double data[kThreads];
+__global__ void vectorReductionBlock(const float *a, float *b, int n, Op op,
+                                     float defaultValue) {
+  __shared__ float data[kThreads];
 
   int gi = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -306,18 +306,18 @@ __global__ void vectorReductionBlock(const double *a, double *b, int n, Op op,
 }
 
 template <typename KernelOp, typename AccumulateOp>
-double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
-                       AccumulateOp accumulateOp, double kernelDefaultValue,
-                       double accumulateDefaultValue) {
+float vectorReduction(const CudaBuffer<float> &a, KernelOp kernelOp,
+                      AccumulateOp accumulateOp, float kernelDefaultValue,
+                      float accumulateDefaultValue) {
   const int n = static_cast<int>(a.n);
   const int blocks = (n + kThreads - 1) / kThreads;
 
-  CudaBuffer<double> deviceResult(static_cast<size_t>(blocks));
+  CudaBuffer<float> deviceResult(static_cast<size_t>(blocks));
 
   vectorReductionBlock<<<blocks, kThreads>>>(a.ptr, deviceResult.ptr, n,
                                              kernelOp, kernelDefaultValue);
 
-  std::vector<double> result(blocks);
+  std::vector<float> result(blocks);
   deviceResult.copyToHost(result.data());
 
   return std::accumulate(result.begin(), result.end(), accumulateDefaultValue,
@@ -325,47 +325,47 @@ double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
 }
 
 template <typename KernelOp, typename AccumulateOp>
-double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
-                       AccumulateOp accumulateOp, double kernelDefaultValue) {
+float vectorReduction(const CudaBuffer<float> &a, KernelOp kernelOp,
+                      AccumulateOp accumulateOp, float kernelDefaultValue) {
   return vectorReduction(a, kernelOp, accumulateOp, kernelDefaultValue,
                          kernelDefaultValue);
 }
 
 template <typename KernelOp>
-double vectorReduction(const CudaBuffer<double> &a, KernelOp kernelOp,
-                       double defaultValue) {
+float vectorReduction(const CudaBuffer<float> &a, KernelOp kernelOp,
+                      float defaultValue) {
   return vectorReduction(a, kernelOp, kernelOp, defaultValue, defaultValue);
 }
 
 // --- softmax ---
 
-void SoftMaxInPlace(CudaBuffer<double> &input) {
-  auto mxLambda = [] __host__ __device__(const double &a,
-                                         const double &b) -> double {
+void SoftMaxInPlace(CudaBuffer<float> &input) {
+  auto mxLambda = [] __host__ __device__(const float &a,
+                                         const float &b) -> float {
     return a > b ? a : b;
   };
-  auto sumLambda = [] __host__ __device__(const double &a,
-                                          const double &b) -> double {
+  auto sumLambda = [] __host__ __device__(const float &a,
+                                          const float &b) -> float {
     return a + b;
   };
 
-  double max = vectorReduction(input, mxLambda,
-                               std::numeric_limits<double>::lowest());
+  float max = vectorReduction(input, mxLambda,
+                              std::numeric_limits<float>::lowest());
 
-  vectorMapInPlace(input, [max] __device__ __host__(double &v) {
-    v = exp(v - max);
+  vectorMapInPlace(input, [max] __device__ __host__(float &v) {
+    v = expf(v - max);
     return v;
   });
 
-  double sum = vectorReduction(input, sumLambda, 0.0);
+  float sum = vectorReduction(input, sumLambda, 0.0f);
 
-  vectorMapInPlace(input, [sum] __device__ __host__(double &v) {
+  vectorMapInPlace(input, [sum] __device__ __host__(float &v) {
     v /= sum;
     return v;
   });
 }
 
-void SoftMaxRows(CudaBuffer<double> &scores, int rows, int cols) {
+void SoftMaxRows(CudaBuffer<float> &scores, int rows, int cols) {
   assert(scores.n == static_cast<size_t>(rows) * cols);
   for (int i = 0; i < rows; i++) {
     auto row = scores.slice(static_cast<size_t>(i) * cols, cols);
@@ -382,36 +382,33 @@ CudaBuffer<T> LayerNorm(const CudaBuffer<T> &originalEmbedding,
   const int len = static_cast<int>(originalEmbedding.n);
   assert(gamma.n == originalEmbedding.n && beta.n == originalEmbedding.n);
 
-  auto add = [] __device__ __host__(const double &a, const double &b) -> double {
+  auto add = [] __device__ __host__(const T &a, const T &b) -> T {
     return a + b;
   };
 
-  double sum = vectorReduction(originalEmbedding, add, 0.0);
-  double mean = sum / len;
+  T sum = vectorReduction(originalEmbedding, add, T(0));
+  T mean = sum / static_cast<T>(len);
 
   auto squaredDiffs = vectorMap(
       originalEmbedding,
-      [mean] __device__ __host__(const double &x) -> double {
+      [mean] __device__ __host__(const T &x) -> T {
         return (x - mean) * (x - mean);
       });
 
-  double sumSquaredDiffs = vectorReduction(squaredDiffs, add, 0.0);
-  double variance = sumSquaredDiffs / len;
+  T sumSquaredDiffs = vectorReduction(squaredDiffs, add, T(0));
+  T variance = sumSquaredDiffs / static_cast<T>(len);
 
-  double modifiedStandardDeviation = sqrt(variance + epsilon);
+  T modifiedStandardDeviation = sqrt(variance + epsilon);
 
   auto normalized = vectorMap(
       originalEmbedding,
-      [mean, modifiedStandardDeviation] __device__ __host__(
-          const double &x) -> double {
+      [mean, modifiedStandardDeviation] __device__ __host__(const T &x) -> T {
         return (x - mean) / modifiedStandardDeviation;
       });
 
   auto scaled = vectorCombine(
       normalized, gamma,
-      [] __device__ __host__(const double &a, const double &b) -> double {
-        return a * b;
-      });
+      [] __device__ __host__(const T &a, const T &b) -> T { return a * b; });
 
   return vectorCombine(scaled, beta, add);
 }
@@ -427,7 +424,7 @@ __global__ void causalMaskKernel(T *scores, int rows, int cols,
     int i = idx / cols;
     int j = idx % cols;
     if (j > queryPosOffset + i)
-      scores[idx] = -CUDART_INF;
+      scores[idx] = -CUDART_INF_F;
   }
 }
 

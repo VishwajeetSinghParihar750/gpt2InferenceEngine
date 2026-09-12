@@ -7,4 +7,4 @@ constexpr int N_HEAD = 12;
 constexpr int N_LAYER = 12;
 constexpr int N_CTX = 1024;
 constexpr int MLP_HIDDEN = 3072;
-const double EPSILON = 1e-5;
+constexpr float EPSILON = 1e-5f;

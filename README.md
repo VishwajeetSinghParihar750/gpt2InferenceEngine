@@ -14,12 +14,12 @@ Enter text: The quick brown fox
 
 ## What you need
 
-| Tool | Why |
-|------|-----|
-| **NVIDIA GPU + drivers** | Runs inference on CUDA |
-| **nvcc** (CUDA toolkit) | Compiles `main.cu` |
-| **Python 3.12+** | One-time weight export from Hugging Face |
-| **uv** (optional) | Easier Python deps — or use pip |
+| Tool                     | Why                                      |
+| ------------------------ | ---------------------------------------- |
+| **NVIDIA GPU + drivers** | Runs inference on CUDA                   |
+| **nvcc** (CUDA toolkit)  | Compiles `main.cu`                       |
+| **Python 3.12+**         | One-time weight export from Hugging Face |
+| **uv** (optional)        | Easier Python deps — or use pip          |
 
 ---
 
@@ -119,43 +119,43 @@ gpt2InferenceEngine/
 
 **Where to edit**
 
-| Change… | Open… |
-|---|---|
-| Generation / blocks / weight load | `model.cuh` |
-| BPE tokenization | `tokenizer.cuh` |
-| GPU math kernels | `ops.cuh` |
-| Device buffer API | `buffer.cuh` |
-| Hyperparameters | `constants.hh` |
+| Change…                           | Open…           |
+| --------------------------------- | --------------- |
+| Generation / blocks / weight load | `model.cuh`     |
+| BPE tokenization                  | `tokenizer.cuh` |
+| GPU math kernels                  | `ops.cuh`       |
+| Device buffer API                 | `buffer.cuh`    |
+| Hyperparameters                   | `constants.hh`  |
 
 ---
 
 ## Model (GPT-2 small)
 
-| | |
-|---|---|
-| Vocabulary | 50,257 |
-| Embedding dim | 768 |
-| Heads | 12 (head dim 64) |
-| Layers | 12 |
-| Context | 1,024 |
-| MLP hidden | 3,072 |
-| Activation | GELU (tanh approx) |
-| Precision | `double` on GPU |
+|               |                    |
+| ------------- | ------------------ |
+| Vocabulary    | 50,257             |
+| Embedding dim | 768                |
+| Heads         | 12 (head dim 64)   |
+| Layers        | 12                 |
+| Context       | 1,024              |
+| MLP hidden    | 3,072              |
+| Activation    | GELU (tanh approx) |
+| Precision     | `float` on GPU     |
 
 ---
 
 ## CUDA ops (`ops.cuh`)
 
-| Helper | Role |
-|---|---|
-| `MatMul` | Tiled matrix multiply |
-| `Transpose` | Matrix transpose |
-| `LayerNorm` | Mean/var normalize + scale/shift |
-| `SoftMaxInPlace` / `SoftMaxRows` | Stable softmax |
-| `causalMask` | Mask future tokens in attention |
-| `packHead` | Write one attention head into the concat buffer |
-| `ForwardPass` | Linear layer (+ GELU for MLP) |
-| `vectorCombine` / `vectorMap` / `vectorReduction` | Elementwise ops and reductions |
+| Helper                                            | Role                                            |
+| ------------------------------------------------- | ----------------------------------------------- |
+| `MatMul`                                          | Tiled matrix multiply                           |
+| `Transpose`                                       | Matrix transpose                                |
+| `LayerNorm`                                       | Mean/var normalize + scale/shift                |
+| `SoftMaxInPlace` / `SoftMaxRows`                  | Stable softmax                                  |
+| `causalMask`                                      | Mask future tokens in attention                 |
+| `packHead`                                        | Write one attention head into the concat buffer |
+| `ForwardPass`                                     | Linear layer (+ GELU for MLP)                   |
+| `vectorCombine` / `vectorMap` / `vectorReduction` | Elementwise ops and reductions                  |
 
 Weights use Hugging Face names, e.g. `transformer.h.0.attn.c_attn.weight.txt`. Q/K/V are interleaved in `c_attn` and split when loading.
 
@@ -163,7 +163,7 @@ Weights use Hugging Face names, e.g. `transformer.h.0.attn.c_attn.weight.txt`. Q
 
 ## Perf log
 
-- CPU ~0.3 tok/s → GPU ~1 tok/s → attention on GPU ~5 tok/s
+- CPU ~0.3 tok/s → GPU ~1 tok/s → kvCache on GPU ~5 tok/s → fused qkv ~7.7 tok/s -> double changed to float ~20 tok/s
 
 ---
 
