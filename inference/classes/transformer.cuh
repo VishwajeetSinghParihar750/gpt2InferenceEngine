@@ -2,6 +2,11 @@
 
 #include <cmath>
 #include <cuda_runtime.h>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "../constants.hh"
 #include "../kernels/causalMask.cuh"
@@ -16,17 +21,35 @@
 #include "cudaBuffer.cuh"
 #include "weights.cuh"
 
-struct Transformer {
+class Transformer {
 
-  static CudaBuffer<double> Attention(
-      const CudaBuffer<double> &embeddings, const CudaBuffer<double> &qWeights,
-      const CudaBuffer<double> &kWeights, const CudaBuffer<double> &vWeights,
-      const CudaBuffer<double> &qBiases, const CudaBuffer<double> &kBiases,
-      const CudaBuffer<double> &vBiases, int NUM_TOKENS, int embedDim,
-      int headDim) {
-    auto project = [&](const CudaBuffer<double> &weights,
+  std::vector<BlockWeights> weights;
+  // kvCache
+  CudaBuffer<double> kCache[12], vCache[12];
+
+  CudaBuffer<double> Attention(const CudaBuffer<double> &embeddings,
+                               int blockIdx, int headIdx, int NUM_TOKENS) {
+    constexpr int embedDim = N_EMBD;
+    constexpr int headDim = N_EMBD / N_HEAD;
+    const auto &attn = weights[blockIdx].attn;
+    const int weightBlockSize = embedDim * headDim;
+
+    auto qWeights = attn.q.slice(static_cast<size_t>(headIdx) * weightBlockSize,
+                                 weightBlockSize);
+    auto kWeights = attn.k.slice(static_cast<size_t>(headIdx) * weightBlockSize,
+                                 weightBlockSize);
+    auto vWeights = attn.v.slice(static_cast<size_t>(headIdx) * weightBlockSize,
+                                 weightBlockSize);
+    auto qBiases =
+        attn.qb.slice(static_cast<size_t>(headIdx) * headDim, headDim);
+    auto kBiases =
+        attn.kb.slice(static_cast<size_t>(headIdx) * headDim, headDim);
+    auto vBiases =
+        attn.vb.slice(static_cast<size_t>(headIdx) * headDim, headDim);
+
+    auto project = [&](const CudaBuffer<double> &w,
                        const CudaBuffer<double> &biases) -> CudaBuffer<double> {
-      auto wT = CUDA::Transpose(weights, headDim, embedDim);
+      auto wT = CUDA::Transpose(w, headDim, embedDim);
       auto proj = CUDA::MatMul<double>(embeddings, wT, NUM_TOKENS, embedDim,
                                        embedDim, headDim);
       CUDA::addRowBias(proj, biases, NUM_TOKENS, headDim);
@@ -41,10 +64,6 @@ struct Transformer {
 
     auto qkTranspose = CUDA::MatMul<double>(
         qProjections, kTranspose, NUM_TOKENS, headDim, headDim, NUM_TOKENS);
-
-    qProjections = CudaBuffer<double>();
-    kProjections = CudaBuffer<double>();
-    kTranspose = CudaBuffer<double>();
 
     double dimensionsRoot = sqrt(headDim);
 
@@ -61,56 +80,39 @@ struct Transformer {
                                 NUM_TOKENS, NUM_TOKENS, headDim);
   }
 
-  static CudaBuffer<double> MultiHeadAttention(
-      const CudaBuffer<double> &embeddings, const CudaBuffer<double> &qWeights,
-      const CudaBuffer<double> &kWeights, const CudaBuffer<double> &vWeights,
-      const CudaBuffer<double> &oWeights, const CudaBuffer<double> &oBiases,
-      const CudaBuffer<double> &qBiases, const CudaBuffer<double> &kBiases,
-      const CudaBuffer<double> &vBiases, int NUM_TOKENS, int embedDim,
-      int heads, int headDim) {
+  CudaBuffer<double> MultiHeadAttention(const CudaBuffer<double> &embeddings,
+                                        int blockIdx, int NUM_TOKENS) {
+    constexpr int embedDim = N_EMBD;
+    constexpr int headDim = N_EMBD / N_HEAD;
+    const auto &attn = weights[blockIdx].attn;
+
     CudaBuffer<double> packed(static_cast<size_t>(NUM_TOKENS) * embedDim);
     packed.zero();
 
-    int weightBlockSize = embedDim * headDim;
-
-    for (int h = 0; h < heads; h++) {
-      auto qHead = qWeights.slice(static_cast<size_t>(h) * weightBlockSize,
-                                  weightBlockSize);
-      auto kHead = kWeights.slice(static_cast<size_t>(h) * weightBlockSize,
-                                  weightBlockSize);
-      auto vHead = vWeights.slice(static_cast<size_t>(h) * weightBlockSize,
-                                  weightBlockSize);
-
-      auto qBiasHead = qBiases.slice(static_cast<size_t>(h) * headDim, headDim);
-      auto kBiasHead = kBiases.slice(static_cast<size_t>(h) * headDim, headDim);
-      auto vBiasHead = vBiases.slice(static_cast<size_t>(h) * headDim, headDim);
-
-      auto curResult =
-          Attention(embeddings, qHead, kHead, vHead, qBiasHead, kBiasHead,
-                    vBiasHead, NUM_TOKENS, embedDim, headDim);
-
+    for (int h = 0; h < N_HEAD; h++) {
+      auto curResult = Attention(embeddings, blockIdx, h, NUM_TOKENS);
       CUDA::packHead(curResult, packed, NUM_TOKENS, headDim, embedDim, h);
     }
 
-    auto projectionResult = CUDA::MatMul<double>(packed, oWeights, NUM_TOKENS,
+    auto projectionResult = CUDA::MatMul<double>(packed, attn.o, NUM_TOKENS,
                                                  embedDim, embedDim, embedDim);
 
-    CUDA::addRowBias(projectionResult, oBiases, NUM_TOKENS, embedDim);
+    CUDA::addRowBias(projectionResult, attn.ob, NUM_TOKENS, embedDim);
     return projectionResult;
   }
 
-  static CudaBuffer<double>
-  MLP(const CudaBuffer<double> &embeddings, const CudaBuffer<double> &l1Weights,
-      const CudaBuffer<double> &l1Biases, const CudaBuffer<double> &l2Weights,
-      const CudaBuffer<double> &l2Biases, int NUM_TOKENS, int dimensions) {
+  CudaBuffer<double> MLP(const CudaBuffer<double> &embeddings, int blockIdx,
+                         int NUM_TOKENS) {
+    constexpr int dimensions = N_EMBD;
+    const auto &mlp = weights[blockIdx].mlp;
     CudaBuffer<double> result(static_cast<size_t>(NUM_TOKENS) * dimensions);
 
     for (int i = 0; i < NUM_TOKENS; i++) {
       auto tokenEmbedding =
           embeddings.slice(static_cast<size_t>(i) * dimensions, dimensions);
       auto hiddenOut =
-          CUDA::ForwardPass(l1Weights, l1Biases, tokenEmbedding, true);
-      auto out = CUDA::ForwardPass(l2Weights, l2Biases, hiddenOut);
+          CUDA::ForwardPass(mlp.fc, mlp.fcb, tokenEmbedding, true);
+      auto out = CUDA::ForwardPass(mlp.proj, mlp.projb, hiddenOut);
 
       result.copyFrom(out, static_cast<size_t>(i) * dimensions);
     }
@@ -118,11 +120,11 @@ struct Transformer {
     return result;
   }
 
-  static CudaBuffer<double> loop(const BlockWeights &input,
-                                 const CudaBuffer<double> &embeddings,
-                                 int NUM_TOKENS) {
+  CudaBuffer<double> loopBlock(int blockIdx,
+                               const CudaBuffer<double> &embeddings,
+                               int NUM_TOKENS) {
     constexpr int D = N_EMBD;
-    constexpr int HEAD_DIM = N_EMBD / N_HEAD;
+    const auto &input = weights[blockIdx];
 
     auto add = [] __host__ __device__(const double &x, const double &y)
         -> double { return x + y; };
@@ -137,10 +139,8 @@ struct Transformer {
       layerNormedEmbeddings.copyFrom(normed, static_cast<size_t>(i) * D);
     }
 
-    auto attentionResult = MultiHeadAttention(
-        layerNormedEmbeddings, input.attn.q, input.attn.k, input.attn.v,
-        input.attn.o, input.attn.ob, input.attn.qb, input.attn.kb,
-        input.attn.vb, NUM_TOKENS, D, N_HEAD, HEAD_DIM);
+    auto attentionResult =
+        MultiHeadAttention(layerNormedEmbeddings, blockIdx, NUM_TOKENS);
 
     layerNormedEmbeddings = CudaBuffer<double>();
 
@@ -160,8 +160,7 @@ struct Transformer {
       normedForMLP.copyFrom(normed, static_cast<size_t>(i) * D);
     }
 
-    auto MLPResult = MLP(normedForMLP, input.mlp.fc, input.mlp.fcb,
-                         input.mlp.proj, input.mlp.projb, NUM_TOKENS, D);
+    auto MLPResult = MLP(normedForMLP, blockIdx, NUM_TOKENS);
 
     normedForMLP = CudaBuffer<double>();
 
@@ -172,5 +171,184 @@ struct Transformer {
     }
 
     return MLPResult;
+  }
+
+public:
+  Transformer() : weights(N_LAYER) {
+
+    for (auto &i : kCache)
+      i.resize(N_CTX * N_EMBD);
+    for (auto &i : vCache)
+      i.resize(N_CTX * N_EMBD);
+
+    std::cout << "Loading weights ... " << std::endl;
+
+    constexpr size_t D = N_EMBD;
+    constexpr size_t HIDDEN = MLP_HIDDEN;
+    constexpr size_t ATTN_WEIGHT_SIZE = D * D;
+    constexpr size_t ATTN_BIAS_SIZE = D;
+    constexpr size_t L1_WEIGHT_SIZE = HIDDEN * D;
+    constexpr size_t L2_WEIGHT_SIZE = D * HIDDEN;
+
+    auto copyToDevice = [](const double *hostPtr,
+                           size_t count) -> CudaBuffer<double> {
+      return CudaBuffer<double>(hostPtr, count);
+    };
+
+    // Host buffer -> device -> transpose on GPU. Frees hostPtr.
+    auto transposeHostToDevice = [&](double *hostPtr, size_t count, int n,
+                                     int m) -> CudaBuffer<double> {
+      CudaBuffer<double> dev(hostPtr, count);
+      delete[] hostPtr;
+      return CUDA::Transpose(dev, n, m);
+    };
+
+    for (size_t i = 0; i < static_cast<size_t>(N_LAYER); i++) {
+      double *gammaAttention = new double[D];
+      double *betaAttention = new double[D];
+      double *gammaMLP = new double[D];
+      double *betaMLP = new double[D];
+      double *l1Weights = new double[L1_WEIGHT_SIZE];
+      double *l1Biases = new double[HIDDEN];
+      double *l2Weights = new double[L2_WEIGHT_SIZE];
+      double *l2Biases = new double[D];
+      double *qWeights = new double[ATTN_WEIGHT_SIZE];
+      double *kWeights = new double[ATTN_WEIGHT_SIZE];
+      double *vWeights = new double[ATTN_WEIGHT_SIZE];
+      double *qBiases = new double[ATTN_BIAS_SIZE];
+      double *kBiases = new double[ATTN_BIAS_SIZE];
+      double *vBiases = new double[ATTN_BIAS_SIZE];
+      double *oWeights = new double[ATTN_WEIGHT_SIZE];
+      double *oBiases = new double[ATTN_BIAS_SIZE];
+
+      {
+        std::ifstream ln1Weights("../weights/transformer.h." +
+                                 std::to_string(i) + ".ln_1.weight.txt");
+        InputVectorFromFilePtr(gammaAttention, ln1Weights, D);
+        std::ifstream ln1Biases("../weights/transformer.h." +
+                                std::to_string(i) + ".ln_1.bias.txt");
+        InputVectorFromFilePtr(betaAttention, ln1Biases, D);
+      }
+
+      {
+        std::ifstream ln2Weights("../weights/transformer.h." +
+                                 std::to_string(i) + ".ln_2.weight.txt");
+        InputVectorFromFilePtr(gammaMLP, ln2Weights, D);
+        std::ifstream ln2Biases("../weights/transformer.h." +
+                                std::to_string(i) + ".ln_2.bias.txt");
+        InputVectorFromFilePtr(betaMLP, ln2Biases, D);
+      }
+
+      {
+        std::ifstream mlpL1Weights("../weights/transformer.h." +
+                                   std::to_string(i) + ".mlp.c_fc.weight.txt");
+        InputVectorFromFilePtr(l1Weights, mlpL1Weights, L1_WEIGHT_SIZE);
+        std::ifstream mlpL1Biases("../weights/transformer.h." +
+                                  std::to_string(i) + ".mlp.c_fc.bias.txt");
+        InputVectorFromFilePtr(l1Biases, mlpL1Biases, HIDDEN);
+      }
+
+      {
+        std::ifstream mlpL2Weights("../weights/transformer.h." +
+                                   std::to_string(i) +
+                                   ".mlp.c_proj.weight.txt");
+        InputVectorFromFilePtr(l2Weights, mlpL2Weights, L2_WEIGHT_SIZE);
+        std::ifstream mlpL2Biases("../weights/transformer.h." +
+                                  std::to_string(i) + ".mlp.c_proj.bias.txt");
+        InputVectorFromFilePtr(l2Biases, mlpL2Biases, D);
+      }
+
+      auto l1Weights_device =
+          transposeHostToDevice(l1Weights, L1_WEIGHT_SIZE, D, HIDDEN);
+      l1Weights = nullptr;
+      auto l2Weights_device =
+          transposeHostToDevice(l2Weights, L2_WEIGHT_SIZE, HIDDEN, D);
+      l2Weights = nullptr;
+
+      {
+        std::ifstream qkvWeightsFile("../weights/transformer.h." +
+                                     std::to_string(i) +
+                                     ".attn.c_attn.weight.txt");
+        size_t qIdx = 0, kIdx = 0, vIdx = 0;
+        for (size_t j = 0; j < D; j++) {
+          InputVectorFromFilePtr(qWeights + qIdx, qkvWeightsFile, D);
+          qIdx += D;
+          InputVectorFromFilePtr(kWeights + kIdx, qkvWeightsFile, D);
+          kIdx += D;
+          InputVectorFromFilePtr(vWeights + vIdx, qkvWeightsFile, D);
+          vIdx += D;
+        }
+
+        std::ifstream qkvBiases("../weights/transformer.h." +
+                                std::to_string(i) + ".attn.c_attn.bias.txt");
+        InputVectorFromFilePtr(qBiases, qkvBiases, D);
+        InputVectorFromFilePtr(kBiases, qkvBiases, D);
+        InputVectorFromFilePtr(vBiases, qkvBiases, D);
+      }
+
+      auto qWeights_device =
+          transposeHostToDevice(qWeights, ATTN_WEIGHT_SIZE, D, D);
+      qWeights = nullptr;
+      auto kWeights_device =
+          transposeHostToDevice(kWeights, ATTN_WEIGHT_SIZE, D, D);
+      kWeights = nullptr;
+      auto vWeights_device =
+          transposeHostToDevice(vWeights, ATTN_WEIGHT_SIZE, D, D);
+      vWeights = nullptr;
+
+      {
+        std::ifstream attnOutputProjWeights("../weights/transformer.h." +
+                                            std::to_string(i) +
+                                            ".attn.c_proj.weight.txt");
+        InputVectorFromFilePtr(oWeights, attnOutputProjWeights,
+                               ATTN_WEIGHT_SIZE);
+
+        std::ifstream attnOutputProjBiases("../weights/transformer.h." +
+                                           std::to_string(i) +
+                                           ".attn.c_proj.bias.txt");
+        InputVectorFromFilePtr(oBiases, attnOutputProjBiases, ATTN_BIAS_SIZE);
+      }
+
+      BlockWeights &block = weights[i];
+      block.ln1.gamma = copyToDevice(gammaAttention, D);
+      block.ln1.beta = copyToDevice(betaAttention, D);
+      block.ln2.gamma = copyToDevice(gammaMLP, D);
+      block.ln2.beta = copyToDevice(betaMLP, D);
+
+      block.attn.q = std::move(qWeights_device);
+      block.attn.k = std::move(kWeights_device);
+      block.attn.v = std::move(vWeights_device);
+      block.attn.o = copyToDevice(oWeights, ATTN_WEIGHT_SIZE);
+      block.attn.qb = copyToDevice(qBiases, ATTN_BIAS_SIZE);
+      block.attn.kb = copyToDevice(kBiases, ATTN_BIAS_SIZE);
+      block.attn.vb = copyToDevice(vBiases, ATTN_BIAS_SIZE);
+      block.attn.ob = copyToDevice(oBiases, ATTN_BIAS_SIZE);
+
+      block.mlp.fc = std::move(l1Weights_device);
+      block.mlp.fcb = copyToDevice(l1Biases, HIDDEN);
+      block.mlp.proj = std::move(l2Weights_device);
+      block.mlp.projb = copyToDevice(l2Biases, D);
+
+      delete[] gammaAttention;
+      delete[] betaAttention;
+      delete[] gammaMLP;
+      delete[] betaMLP;
+      delete[] l1Biases;
+      delete[] l2Biases;
+      delete[] qBiases;
+      delete[] kBiases;
+      delete[] vBiases;
+      delete[] oWeights;
+      delete[] oBiases;
+    }
+  }
+
+  CudaBuffer<double> loop(const CudaBuffer<double> &embeddings,
+                          int NUM_TOKENS) {
+    auto result = loopBlock(0, embeddings, NUM_TOKENS);
+    for (int i = 1; i < N_LAYER; i++) {
+      result = loopBlock(i, result, NUM_TOKENS);
+    }
+    return result;
   }
 };

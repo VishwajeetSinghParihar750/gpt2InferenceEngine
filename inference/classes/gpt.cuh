@@ -223,29 +223,28 @@ class Gpt2 {
 
   Gpt2Tokenizer tokenizer;
 
-  TransformerWeights weights;
+  Transformer transformer;
+
+  LnWeights ln_f;
+  CudaBuffer<double> wte;
 
   int generateLogic(const CudaBuffer<double> &embeddings) {
 
     int numEmbeddings = static_cast<int>(embeddings.n / N_EMBD);
 
-    auto result =
-        Transformer::loop(weights.weights[0], embeddings, numEmbeddings);
-    for (int i = 1; i < N_LAYER; i++) {
-      result = Transformer::loop(weights.weights[i], result, numEmbeddings);
-    }
+    auto result = transformer.loop(embeddings, numEmbeddings);
 
     auto lastToken =
         result.slice(static_cast<size_t>(numEmbeddings - 1) * N_EMBD, N_EMBD);
 
-    auto layerNormedResult = CUDA::LayerNorm(lastToken, weights.ln_f.gamma,
-                                             weights.ln_f.beta, EPSILON);
+    auto layerNormedResult =
+        CUDA::LayerNorm(lastToken, ln_f.gamma, ln_f.beta, EPSILON);
 
     result = CudaBuffer<double>();
 
     // logits = wte @ lastToken  (VOCAB_SIZE x 1)
-    auto logits = CUDA::MatMul<double>(weights.wte, layerNormedResult,
-                                       VOCAB_SIZE, N_EMBD, N_EMBD, 1);
+    auto logits = CUDA::MatMul<double>(wte, layerNormedResult, VOCAB_SIZE,
+                                       N_EMBD, N_EMBD, 1);
     layerNormedResult = CudaBuffer<double>();
 
     CUDA::SoftMaxInPlace(logits);
@@ -261,6 +260,37 @@ class Gpt2 {
   }
 
 public:
+  Gpt2() {
+    constexpr size_t D = N_EMBD;
+    constexpr size_t FINAL_LN_SIZE = D;
+    constexpr size_t WTE_SIZE = static_cast<size_t>(VOCAB_SIZE) * D;
+
+    double *finalLayerNormWeights = new double[FINAL_LN_SIZE];
+    double *finalLayerNormBiases = new double[FINAL_LN_SIZE];
+    double *wteHost = new double[WTE_SIZE];
+
+    {
+      std::ifstream lnWeights("../weights/transformer.ln_f.weight.txt");
+      InputVectorFromFilePtr(finalLayerNormWeights, lnWeights, FINAL_LN_SIZE);
+    }
+    {
+      std::ifstream lnBiases("../weights/transformer.ln_f.bias.txt");
+      InputVectorFromFilePtr(finalLayerNormBiases, lnBiases, FINAL_LN_SIZE);
+    }
+    {
+      std::ifstream wteWeightsFile("../weights/transformer.wte.weight.txt");
+      InputVectorFromFilePtr(wteHost, wteWeightsFile, WTE_SIZE);
+    }
+
+    ln_f.gamma = CudaBuffer<double>(finalLayerNormWeights, FINAL_LN_SIZE);
+    ln_f.beta = CudaBuffer<double>(finalLayerNormBiases, FINAL_LN_SIZE);
+    wte = CudaBuffer<double>(wteHost, WTE_SIZE);
+
+    delete[] finalLayerNormWeights;
+    delete[] finalLayerNormBiases;
+    delete[] wteHost;
+  }
+
   void generate(std::string input, int n) {
 
     size_t numTokens = 0;
