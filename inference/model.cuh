@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cuda_runtime.h>
@@ -9,21 +10,41 @@
 #include <utility>
 #include <vector>
 
-#include "../constants.hh"
-#include "../kernels/causalMask.cuh"
-#include "../kernels/forwardPass.cuh"
-#include "../kernels/layerNorm.cuh"
-#include "../kernels/matmul.cuh"
-#include "../kernels/packHead.cuh"
-#include "../kernels/softmax.cuh"
-#include "../kernels/transpose.cuh"
-#include "../kernels/vectorCombine.cuh"
-#include "../kernels/vectorMap.cuh"
-#include "cudaBuffer.cuh"
-#include "weights.cuh"
+#include "buffer.cuh"
+#include "constants.hh"
+#include "ops.cuh"
+#include "tokenizer.cuh"
+
+// Free function so CUDA extended lambdas can live in private methods.
+inline __host__ __device__ double addDoubles(const double &x, const double &y) {
+  return x + y;
+}
+
+struct AttnWeights {
+  CudaBuffer<double> q, k, v, o, qb, kb, vb, ob;
+};
+struct MlpWeights {
+  CudaBuffer<double> fc, proj, fcb, projb;
+};
+struct LnWeights {
+  CudaBuffer<double> gamma, beta;
+};
+struct BlockWeights {
+  LnWeights ln1, ln2;
+  AttnWeights attn;
+  MlpWeights mlp;
+};
+
+inline void InputVectorFromFilePtr(double *ptr, std::ifstream &stream,
+                                   size_t count) {
+  double inp;
+  size_t idx = 0;
+  while (idx < count && stream >> inp) {
+    ptr[idx++] = inp;
+  }
+}
 
 struct Transformer {
-
   std::vector<BlockWeights> weights;
   // kvCache: per layer, head-major [head][pos][headDim]
   CudaBuffer<double> kCache[N_LAYER], vCache[N_LAYER];
@@ -196,7 +217,6 @@ struct Transformer {
 
 public:
   Transformer() : weights(N_LAYER) {
-
     for (auto &i : kCache)
       i.resize(N_CTX * N_EMBD);
     for (auto &i : vCache)
@@ -362,6 +382,8 @@ public:
       delete[] oWeights;
       delete[] oBiases;
     }
+
+    std::cout << "weights loaded ... " << std::endl;
   }
 
   CudaBuffer<double> loop(const CudaBuffer<double> &embeddings,
@@ -385,4 +407,135 @@ public:
   }
 
   void resetKvCache() { kvCacheLen = 0; }
+};
+
+class Gpt2 {
+  Gpt2Tokenizer tokenizer;
+  Transformer transformer;
+
+  LnWeights ln_f;
+  CudaBuffer<double> wte;
+  CudaBuffer<double> wpe;
+
+  CudaBuffer<double> generateEmbeddings(const std::vector<int> &tokenIds) {
+    const size_t countTokens = tokenIds.size();
+    CudaBuffer<double> result(countTokens * N_EMBD);
+
+    for (size_t i = 0; i < countTokens; i++) {
+      auto tokenEmb = wte.slice(tokenIds[i] * N_EMBD, N_EMBD);
+      auto posEmb = wpe.slice(i * N_EMBD, N_EMBD);
+      auto embedding = CUDA::vectorCombine(tokenEmb, posEmb, addDoubles);
+      result.copyFrom(embedding, i * N_EMBD);
+    }
+
+    return result;
+  }
+
+  CudaBuffer<double> embeddingFromTokenId(int tokenId, int position) {
+    auto tokenEmb = wte.slice(static_cast<size_t>(tokenId) * N_EMBD, N_EMBD);
+    auto posEmb = wpe.slice(static_cast<size_t>(position) * N_EMBD, N_EMBD);
+    return CUDA::vectorCombine(tokenEmb, posEmb, addDoubles);
+  }
+
+  int generateLogic(const CudaBuffer<double> &embeddings) {
+    int numEmbeddings = static_cast<int>(embeddings.n / N_EMBD);
+
+    auto result = transformer.loop(embeddings, numEmbeddings);
+
+    int resultTokens = static_cast<int>(result.n / N_EMBD);
+    auto lastToken =
+        result.slice(static_cast<size_t>(resultTokens - 1) * N_EMBD, N_EMBD);
+
+    auto layerNormedResult =
+        CUDA::LayerNorm(lastToken, ln_f.gamma, ln_f.beta, EPSILON);
+
+    result = CudaBuffer<double>();
+
+    // logits = wte @ lastToken  (VOCAB_SIZE x 1)
+    auto logits = CUDA::MatMul<double>(wte, layerNormedResult, VOCAB_SIZE,
+                                       N_EMBD, N_EMBD, 1);
+    layerNormedResult = CudaBuffer<double>();
+
+    CUDA::SoftMaxInPlace(logits);
+
+    std::vector<double> hostProbs(VOCAB_SIZE);
+    logits.copyToHost(hostProbs.data());
+
+    int maxProbTokenId =
+        static_cast<int>(std::max_element(hostProbs.begin(), hostProbs.end()) -
+                         hostProbs.begin());
+
+    return maxProbTokenId;
+  }
+
+public:
+  Gpt2() {
+    constexpr size_t D = N_EMBD;
+    constexpr size_t FINAL_LN_SIZE = D;
+    constexpr size_t WTE_SIZE = static_cast<size_t>(VOCAB_SIZE) * D;
+    constexpr size_t WPE_SIZE = static_cast<size_t>(N_CTX) * D;
+
+    double *finalLayerNormWeights = new double[FINAL_LN_SIZE];
+    double *finalLayerNormBiases = new double[FINAL_LN_SIZE];
+    double *wteHost = new double[WTE_SIZE];
+    double *wpeHost = new double[WPE_SIZE];
+
+    {
+      std::ifstream lnWeights("../weights/transformer.ln_f.weight.txt");
+      InputVectorFromFilePtr(finalLayerNormWeights, lnWeights, FINAL_LN_SIZE);
+    }
+    {
+      std::ifstream lnBiases("../weights/transformer.ln_f.bias.txt");
+      InputVectorFromFilePtr(finalLayerNormBiases, lnBiases, FINAL_LN_SIZE);
+    }
+    {
+      std::ifstream wteWeightsFile("../weights/transformer.wte.weight.txt");
+      InputVectorFromFilePtr(wteHost, wteWeightsFile, WTE_SIZE);
+    }
+    {
+      std::ifstream wpeWeightsFile("../weights/transformer.wpe.weight.txt");
+      InputVectorFromFilePtr(wpeHost, wpeWeightsFile, WPE_SIZE);
+    }
+
+    ln_f.gamma = CudaBuffer<double>(finalLayerNormWeights, FINAL_LN_SIZE);
+    ln_f.beta = CudaBuffer<double>(finalLayerNormBiases, FINAL_LN_SIZE);
+    wte = CudaBuffer<double>(wteHost, WTE_SIZE);
+    wpe = CudaBuffer<double>(wpeHost, WPE_SIZE);
+
+    delete[] finalLayerNormWeights;
+    delete[] finalLayerNormBiases;
+    delete[] wteHost;
+    delete[] wpeHost;
+  }
+
+  void generate(std::string input, int n) {
+    transformer.resetKvCache();
+
+    auto tokenIds = tokenizer.encode(input);
+    size_t numTokens = tokenIds.size();
+    auto promptEmbeddings = generateEmbeddings(tokenIds);
+
+    CudaBuffer<double> embeddings;
+    embeddings.reserve(static_cast<size_t>(N_CTX) * N_EMBD);
+    embeddings.resize(numTokens * N_EMBD);
+    embeddings.copyFrom(promptEmbeddings);
+    promptEmbeddings = CudaBuffer<double>();
+
+    int tokenToGenerate = n;
+    while (tokenToGenerate--) {
+      int nextToken = generateLogic(embeddings);
+
+      if (tokenToGenerate) {
+        auto nextTokenEmbedding =
+            embeddingFromTokenId(nextToken, static_cast<int>(numTokens));
+
+        embeddings.resize((numTokens + 1) * N_EMBD);
+        embeddings.copyFrom(nextTokenEmbedding, numTokens * N_EMBD);
+        numTokens++;
+      }
+
+      std::cout << tokenizer.decode(nextToken);
+      std::cout.flush();
+    }
+  }
 };
