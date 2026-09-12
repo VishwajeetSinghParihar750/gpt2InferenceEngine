@@ -161,6 +161,12 @@ Weights use Hugging Face names, e.g. `transformer.h.0.attn.c_attn.weight.txt`. Q
 
 ---
 
+## Perf log
+
+- CPU ~0.3 tok/s → GPU ~1 tok/s → attention on GPU ~5 tok/s
+
+---
+
 ## Notes
 
 - Build and run from `inference/` so paths to `../weights/` and the tokenizer stay correct.
