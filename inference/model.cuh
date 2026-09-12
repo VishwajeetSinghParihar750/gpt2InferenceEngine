@@ -15,10 +15,13 @@
 #include "ops.cuh"
 #include "tokenizer.cuh"
 
-// Free function so CUDA extended lambdas can live in private methods.
-inline __host__ __device__ double addDoubles(const double &x, const double &y) {
-  return x + y;
-}
+// Functor (not a function pointer) so the kernel gets a real __device__ call.
+struct AddDoubles {
+  __host__ __device__ double operator()(const double &x,
+                                        const double &y) const {
+    return x + y;
+  }
+};
 
 struct AttnWeights {
   CudaBuffer<double> q, k, v, o, qb, kb, vb, ob;
@@ -424,7 +427,7 @@ class Gpt2 {
     for (size_t i = 0; i < countTokens; i++) {
       auto tokenEmb = wte.slice(tokenIds[i] * N_EMBD, N_EMBD);
       auto posEmb = wpe.slice(i * N_EMBD, N_EMBD);
-      auto embedding = CUDA::vectorCombine(tokenEmb, posEmb, addDoubles);
+      auto embedding = CUDA::vectorCombine(tokenEmb, posEmb, AddDoubles{});
       result.copyFrom(embedding, i * N_EMBD);
     }
 
@@ -434,7 +437,7 @@ class Gpt2 {
   CudaBuffer<double> embeddingFromTokenId(int tokenId, int position) {
     auto tokenEmb = wte.slice(static_cast<size_t>(tokenId) * N_EMBD, N_EMBD);
     auto posEmb = wpe.slice(static_cast<size_t>(position) * N_EMBD, N_EMBD);
-    return CUDA::vectorCombine(tokenEmb, posEmb, addDoubles);
+    return CUDA::vectorCombine(tokenEmb, posEmb, AddDoubles{});
   }
 
   int generateLogic(const CudaBuffer<double> &embeddings) {

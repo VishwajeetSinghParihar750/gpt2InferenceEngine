@@ -83,7 +83,7 @@ modelLoader/main.py
       ↓
 weights/*.txt          ← one file per parameter
       ↓  (CUDA, every run)
-inference/main.cu + kernels/
+inference/main.cu + model.cuh + ops.cuh
       ↓
 interactive text generation
 ```
@@ -103,24 +103,29 @@ Pipeline, all hand-written:
 ```
 gpt2InferenceEngine/
 ├── inference/
-│   ├── main.cu              # tokenizer, transformer, weight load, main loop
-│   ├── constants.hh         # model hyperparameters
-│   ├── kernels/             # CUDA ops
-│   │   ├── matmul.cuh
-│   │   ├── layerNorm.cuh
-│   │   ├── softmax.cuh
-│   │   ├── transpose.cuh
-│   │   ├── causalMask.cuh
-│   │   ├── packHead.cuh
-│   │   ├── forwardPass.cuh  # MLP linear + optional GELU
-│   │   └── ...
+│   ├── main.cu          # CLI loop
+│   ├── constants.hh     # model hyperparameters
+│   ├── buffer.cuh       # CudaBuffer (device memory RAII)
+│   ├── ops.cuh          # all CUDA kernels / helpers
+│   ├── tokenizer.cuh    # BPE encode / decode
+│   ├── model.cuh        # weights, Transformer, Gpt2 generate
 │   └── include/
-│       └── json.hpp         # tokenizer.json parsing
+│       └── json.hpp     # tokenizer.json parsing
 ├── modelLoader/
-│   └── main.py              # export HF weights → ../weights/
-├── weights/                 # generated (gitignored)
+│   └── main.py          # export HF weights → ../weights/
+├── weights/             # generated (gitignored)
 └── README.md
 ```
+
+**Where to edit**
+
+| Change… | Open… |
+|---|---|
+| Generation / blocks / weight load | `model.cuh` |
+| BPE tokenization | `tokenizer.cuh` |
+| GPU math kernels | `ops.cuh` |
+| Device buffer API | `buffer.cuh` |
+| Hyperparameters | `constants.hh` |
 
 ---
 
@@ -139,16 +144,14 @@ gpt2InferenceEngine/
 
 ---
 
-## CUDA kernels (what lives where)
+## CUDA ops (`ops.cuh`)
 
-High-level GPT logic stays in `main.cu`. Math runs in `kernels/`:
-
-| Kernel / helper | Role |
+| Helper | Role |
 |---|---|
 | `MatMul` | Tiled matrix multiply |
-| `LayerNorm` | Mean/var normalize + scale/shift |
-| `SoftMax` / `SoftMaxRows` | Stable softmax (1D or per row) |
 | `Transpose` | Matrix transpose |
+| `LayerNorm` | Mean/var normalize + scale/shift |
+| `SoftMaxInPlace` / `SoftMaxRows` | Stable softmax |
 | `causalMask` | Mask future tokens in attention |
 | `packHead` | Write one attention head into the concat buffer |
 | `ForwardPass` | Linear layer (+ GELU for MLP) |
